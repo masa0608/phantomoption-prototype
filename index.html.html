@@ -1,0 +1,2435 @@
+/**
+ * LTI（中長期貢献賞与）運用プラットフォーム - UIプロトタイプ（単一ファイル）
+ * -------------------------------------------------------------------------
+ * 目的:
+ * - 医療機関（病院/訪問看護）での「勤続＋遵守ゲート＋年次プール＋繰延残高」制度を
+ *   “そのまま提案できる見た目”で可視化するためのフロントUI。
+ *
+ * 使い方（例: Vite + React + TS + Tailwind）
+ * 1) `npm create vite@latest lti-ui -- --template react-ts`
+ * 2) Tailwind導入（公式手順）
+ * 3) src/App.tsx をこのファイルで置き換え
+ * 4) `npm run dev`
+ *
+ * 注意:
+ * - 本UIは「ゼロPHI（患者個票なし）」前提。表示・入力は集計/職員データのみ。
+ * - 実運用では、権限管理（RBAC）、監査ログ、承認フロー、暗号化、契約/責任分界が必須。
+ */
+
+import React, { useMemo, useState } from "react";
+
+/* ----------------------------- Types ----------------------------- */
+
+type Role = "client_admin" | "client_payroll" | "client_viewer" | "nurse" | "operator";
+
+type TenantType = "hospital" | "home_nursing_agency";
+type Tenant = {
+  id: string;
+  name: string;
+  type: TenantType;
+  hasPHI: boolean; // prototype: should be false (ゼロPHI)
+  fiscalYear: number;
+  currency: "JPY";
+};
+
+type GateStatus = "pass" | "warn" | "fail";
+
+type FinancialGate = {
+  enabled: boolean;
+  status: GateStatus;
+  note: string;
+  // health metrics (examples)
+  operatingMarginPct?: number;
+  cashMonths?: number;
+};
+
+type SafetyGate = {
+  enabled: boolean;
+  status: GateStatus;
+  note: string;
+  majorIncidentCount?: number;
+  complianceFlag?: boolean;
+};
+
+type AnnualPool = {
+  year: number;
+  capPolicy: { mode: "pct_payroll" | "fixed"; value: number }; // % or JPY
+  decidedPoolJPY: number;
+  decidedAt: string; // ISO date
+  decidedBy: string;
+  payoutMix: { immediatePct: number; deferredPct: number }; // sum=100
+  deferralPolicy: { mode: "retirement_only" | "three_year" | "hybrid"; note: string };
+  approved: boolean;
+  approvalTrail: Array<{ at: string; by: string; action: "drafted" | "approved" | "reopened" }>;
+};
+
+type TenureBand = {
+  minYears: number;
+  maxYears: number | null; // null = infinity
+  points: number;
+};
+
+type EligibilityRule = {
+  id: string;
+  label: string;
+  description: string;
+  // For prototype: measured by nurse fields.
+  field: "requiredTrainingComplete" | "seriousDisciplinaryAction" | "recordTimelinessOK" | "unexcusedAbsenceOverLimit";
+  mustBe: boolean; // field must equal mustBe to be eligible
+};
+
+type Nurse = {
+  id: string;
+  name: string;
+  employeeId: string;
+  unit: string; // ward or station
+  crossUnit: boolean;
+  hireDate: string; // ISO
+  status: "active" | "leave" | "resigned";
+  roleTags: string[]; // e.g., preceptor
+  // Compliance signals
+  requiredTrainingComplete: boolean;
+  recordTimelinessOK: boolean;
+  unexcusedAbsenceOverLimit: boolean;
+  seriousDisciplinaryAction: boolean;
+
+  // allocation (for cross-unit)
+  fteAllocations: Array<{ unit: string; pct: number }>; // totals ~100
+  // LTI balance and accrual
+  ltiBalanceJPY: number; // deferred
+  ltiAccruedThisYearJPY: number; // total, before mix
+  ltiImmediateThisYearJPY: number;
+  ltiDeferredThisYearJPY: number;
+
+  // computed
+  eligible: boolean;
+  eligibilityReasons: string[];
+  tenureYears: number;
+  tenurePoints: number;
+  sharePct: number; // of total distribution
+};
+
+type ExportJob = {
+  id: string;
+  createdAt: string;
+  createdBy: string;
+  status: "queued" | "completed" | "failed";
+  format: "CSV_PAYROLL" | "PDF_AUDIT";
+  note: string;
+};
+
+type AuditLog = {
+  at: string;
+  actor: string;
+  action: string;
+  scope: "policy" | "pool" | "roster" | "export" | "security" | "support";
+  details: string;
+};
+
+type Ticket = {
+  id: string;
+  createdAt: string;
+  createdBy: string;
+  category: "data_error" | "policy_question" | "security" | "other";
+  status: "open" | "in_progress" | "resolved";
+  title: string;
+  body: string;
+  relatedNurseId?: string;
+};
+
+/* ----------------------------- UI Primitives ----------------------------- */
+
+function clsx(...xs: Array<string | false | undefined | null>) {
+  return xs.filter(Boolean).join(" ");
+}
+
+const Badge = ({ children, tone = "gray" }: { children: React.ReactNode; tone?: "gray" | "green" | "yellow" | "red" | "blue" }) => {
+  const map: Record<string, string> = {
+    gray: "bg-slate-100 text-slate-700 ring-slate-200",
+    green: "bg-emerald-100 text-emerald-700 ring-emerald-200",
+    yellow: "bg-amber-100 text-amber-800 ring-amber-200",
+    red: "bg-rose-100 text-rose-700 ring-rose-200",
+    blue: "bg-sky-100 text-sky-700 ring-sky-200",
+  };
+  return (
+    <span className={clsx("inline-flex items-center rounded-full px-2 py-0.5 text-xs font-medium ring-1 ring-inset", map[tone])}>
+      {children}
+    </span>
+  );
+};
+
+const Button = ({
+  children,
+  variant = "primary",
+  onClick,
+  disabled,
+  title,
+}: {
+  children: React.ReactNode;
+  variant?: "primary" | "secondary" | "ghost" | "danger";
+  onClick?: () => void;
+  disabled?: boolean;
+  title?: string;
+}) => {
+  const base = "inline-flex items-center justify-center gap-2 rounded-xl px-3 py-2 text-sm font-semibold transition active:scale-[0.99] disabled:opacity-50 disabled:cursor-not-allowed";
+  const v = {
+    primary: "bg-slate-900 text-white hover:bg-slate-800",
+    secondary: "bg-slate-100 text-slate-900 hover:bg-slate-200",
+    ghost: "bg-transparent text-slate-700 hover:bg-slate-100",
+    danger: "bg-rose-600 text-white hover:bg-rose-700",
+  }[variant];
+  return (
+    <button className={clsx(base, v)} onClick={onClick} disabled={disabled} title={title}>
+      {children}
+    </button>
+  );
+};
+
+const Card = ({ children }: { children: React.ReactNode }) => (
+  <div className="rounded-2xl border border-slate-200 bg-white shadow-sm">{children}</div>
+);
+
+const CardHeader = ({ title, subtitle, right }: { title: string; subtitle?: string; right?: React.ReactNode }) => (
+  <div className="flex items-start justify-between gap-4 border-b border-slate-100 p-4">
+    <div>
+      <div className="text-base font-bold text-slate-900">{title}</div>
+      {subtitle ? <div className="mt-1 text-sm text-slate-500">{subtitle}</div> : null}
+    </div>
+    {right}
+  </div>
+);
+
+const CardBody = ({ children }: { children: React.ReactNode }) => <div className="p-4">{children}</div>;
+
+const SectionTitle = ({ title, hint }: { title: string; hint?: string }) => (
+  <div className="mb-2">
+    <div className="text-sm font-semibold text-slate-900">{title}</div>
+    {hint ? <div className="text-xs text-slate-500">{hint}</div> : null}
+  </div>
+);
+
+const Input = ({
+  label,
+  value,
+  onChange,
+  placeholder,
+  type = "text",
+  help,
+}: {
+  label: string;
+  value: string | number;
+  onChange: (v: string) => void;
+  placeholder?: string;
+  type?: "text" | "number";
+  help?: string;
+}) => (
+  <label className="block">
+    <div className="text-xs font-semibold text-slate-700">{label}</div>
+    <input
+      className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-slate-400"
+      value={value}
+      onChange={(e) => onChange(e.target.value)}
+      placeholder={placeholder}
+      type={type}
+    />
+    {help ? <div className="mt-1 text-xs text-slate-500">{help}</div> : null}
+  </label>
+);
+
+const Toggle = ({ label, enabled, onChange, help }: { label: string; enabled: boolean; onChange: (v: boolean) => void; help?: string }) => (
+  <div className="flex items-start justify-between gap-4 rounded-xl border border-slate-200 p-3">
+    <div>
+      <div className="text-sm font-semibold text-slate-900">{label}</div>
+      {help ? <div className="text-xs text-slate-500">{help}</div> : null}
+    </div>
+    <button
+      className={clsx("relative h-7 w-12 rounded-full transition", enabled ? "bg-slate-900" : "bg-slate-200")}
+      onClick={() => onChange(!enabled)}
+      aria-label={label}
+    >
+      <span className={clsx("absolute top-1 h-5 w-5 rounded-full bg-white transition", enabled ? "left-6" : "left-1")} />
+    </button>
+  </div>
+);
+
+const Divider = () => <div className="my-4 h-px w-full bg-slate-100" />;
+
+function fmtJPY(n: number) {
+  return new Intl.NumberFormat("ja-JP", { style: "currency", currency: "JPY", maximumFractionDigits: 0 }).format(n);
+}
+
+function fmtPct(n: number) {
+  return `${(n * 100).toFixed(1)}%`;
+}
+
+function daysBetween(aISO: string, bISO: string) {
+  const a = new Date(aISO).getTime();
+  const b = new Date(bISO).getTime();
+  return Math.max(0, Math.floor((b - a) / (1000 * 60 * 60 * 24)));
+}
+
+function yearsBetween(aISO: string, bISO: string) {
+  const d = daysBetween(aISO, bISO);
+  return d / 365.25;
+}
+
+/* ----------------------------- Demo Data ----------------------------- */
+
+const NOW = new Date().toISOString().slice(0, 10);
+
+const DEMO_TENANT: Tenant = {
+  id: "t-001",
+  name: "さくら訪問看護ステーション（グループ）",
+  type: "home_nursing_agency",
+  hasPHI: false, // key requirement
+  fiscalYear: 2026,
+  currency: "JPY",
+};
+
+const DEMO_TENURE_BANDS: TenureBand[] = [
+  { minYears: 0, maxYears: 1, points: 1 },
+  { minYears: 1, maxYears: 2, points: 2 },
+  { minYears: 2, maxYears: 3, points: 3 },
+  { minYears: 3, maxYears: 5, points: 5 },
+  { minYears: 5, maxYears: 6, points: 6 },
+  { minYears: 6, maxYears: null, points: 6 },
+];
+
+const DEMO_ELIGIBILITY_RULES: EligibilityRule[] = [
+  {
+    id: "r1",
+    label: "必須研修（医療安全・感染・個人情報）受講完了",
+    description: "年度の必須研修が未完了の場合は支給対象外（ゲート）。",
+    field: "requiredTrainingComplete",
+    mustBe: true,
+  },
+  {
+    id: "r2",
+    label: "重大な懲戒・服務違反がない",
+    description: "重大な服務違反がある場合は支給対象外（ゲート）。",
+    field: "seriousDisciplinaryAction",
+    mustBe: false,
+  },
+  {
+    id: "r3",
+    label: "記録期限遵守（最低ライン）",
+    description: "記録の期限遵守が最低ライン未達の場合は支給対象外（ゲート）。",
+    field: "recordTimelinessOK",
+    mustBe: true,
+  },
+  {
+    id: "r4",
+    label: "無断欠勤・重大遅刻が一定以上でない",
+    description: "規程で定めた上限を超える場合は支給対象外（ゲート）。",
+    field: "unexcusedAbsenceOverLimit",
+    mustBe: false,
+  },
+];
+
+const DEMO_FIN_GATE: FinancialGate = {
+  enabled: true,
+  status: "pass",
+  note: "資金繰り水準：基準クリア（現預金 3.2ヶ月）",
+  operatingMarginPct: 1.8,
+  cashMonths: 3.2,
+};
+
+const DEMO_SAFETY_GATE: SafetyGate = {
+  enabled: true,
+  status: "pass",
+  note: "重大インシデントなし／請求コンプラ注意喚起あり（是正済）",
+  majorIncidentCount: 0,
+  complianceFlag: false,
+};
+
+const DEMO_POOL: AnnualPool = {
+  year: 2026,
+  capPolicy: { mode: "pct_payroll", value: 0.02 }, // 2% of nursing payroll
+  decidedPoolJPY: 14_000_000,
+  decidedAt: "2026-04-10",
+  decidedBy: "事務長（本部）",
+  payoutMix: { immediatePct: 25, deferredPct: 75 },
+  deferralPolicy: { mode: "three_year", note: "3年繰延：3年在籍で支給（退職時は規程により取り扱い）" },
+  approved: true,
+  approvalTrail: [
+    { at: "2026-04-02", by: "人事（本部）", action: "drafted" },
+    { at: "2026-04-10", by: "経営会議", action: "approved" },
+  ],
+};
+
+const DEMO_NURSES_BASE: Omit<Nurse, "eligible" | "eligibilityReasons" | "tenureYears" | "tenurePoints" | "sharePct" | "ltiAccruedThisYearJPY" | "ltiImmediateThisYearJPY" | "ltiDeferredThisYearJPY">[] =
+  [
+    {
+      id: "n-001",
+      name: "山田 花子",
+      employeeId: "E1023",
+      unit: "ST_渋谷",
+      crossUnit: false,
+      hireDate: "2022-04-01",
+      status: "active",
+      roleTags: ["プリセプター"],
+      requiredTrainingComplete: true,
+      recordTimelinessOK: true,
+      unexcusedAbsenceOverLimit: false,
+      seriousDisciplinaryAction: false,
+      fteAllocations: [{ unit: "ST_渋谷", pct: 100 }],
+      ltiBalanceJPY: 680_000,
+    },
+    {
+      id: "n-002",
+      name: "佐藤 恒一",
+      employeeId: "E1044",
+      unit: "ST_渋谷",
+      crossUnit: true,
+      hireDate: "2024-11-01",
+      status: "active",
+      roleTags: ["フロート"],
+      requiredTrainingComplete: true,
+      recordTimelinessOK: true,
+      unexcusedAbsenceOverLimit: false,
+      seriousDisciplinaryAction: false,
+      fteAllocations: [
+        { unit: "ST_渋谷", pct: 60 },
+        { unit: "ST_品川", pct: 40 },
+      ],
+      ltiBalanceJPY: 120_000,
+    },
+    {
+      id: "n-003",
+      name: "鈴木 玲奈",
+      employeeId: "E0901",
+      unit: "ST_品川",
+      crossUnit: false,
+      hireDate: "2019-04-01",
+      status: "active",
+      roleTags: ["教育担当"],
+      requiredTrainingComplete: false, // not eligible
+      recordTimelinessOK: true,
+      unexcusedAbsenceOverLimit: false,
+      seriousDisciplinaryAction: false,
+      fteAllocations: [{ unit: "ST_品川", pct: 100 }],
+      ltiBalanceJPY: 1_100_000,
+    },
+    {
+      id: "n-004",
+      name: "田中 直樹",
+      employeeId: "E0777",
+      unit: "ST_品川",
+      crossUnit: false,
+      hireDate: "2020-10-01",
+      status: "active",
+      roleTags: [],
+      requiredTrainingComplete: true,
+      recordTimelinessOK: false, // not eligible
+      unexcusedAbsenceOverLimit: false,
+      seriousDisciplinaryAction: false,
+      fteAllocations: [{ unit: "ST_品川", pct: 100 }],
+      ltiBalanceJPY: 420_000,
+    },
+    {
+      id: "n-005",
+      name: "高橋 美咲",
+      employeeId: "E1122",
+      unit: "ST_渋谷",
+      crossUnit: false,
+      hireDate: "2021-04-01",
+      status: "leave",
+      roleTags: ["育休"],
+      requiredTrainingComplete: true,
+      recordTimelinessOK: true,
+      unexcusedAbsenceOverLimit: false,
+      seriousDisciplinaryAction: false,
+      fteAllocations: [{ unit: "ST_渋谷", pct: 100 }],
+      ltiBalanceJPY: 520_000,
+    },
+    {
+      id: "n-006",
+      name: "伊藤 恒一",
+      employeeId: "E0606",
+      unit: "ST_渋谷",
+      crossUnit: false,
+      hireDate: "2023-04-01",
+      status: "active",
+      roleTags: [],
+      requiredTrainingComplete: true,
+      recordTimelinessOK: true,
+      unexcusedAbsenceOverLimit: true, // not eligible
+      seriousDisciplinaryAction: false,
+      fteAllocations: [{ unit: "ST_渋谷", pct: 100 }],
+      ltiBalanceJPY: 200_000,
+    },
+  ];
+
+/* ----------------------------- Computation ----------------------------- */
+
+function getTenurePoints(tenureYears: number, bands: TenureBand[]): number {
+  for (const b of bands) {
+    const upperOk = b.maxYears == null ? true : tenureYears < b.maxYears;
+    const lowerOk = tenureYears >= b.minYears;
+    if (lowerOk && upperOk) return b.points;
+  }
+  return 0;
+}
+
+function computeEligibility(n: Omit<Nurse, "eligible" | "eligibilityReasons" | "tenureYears" | "tenurePoints" | "sharePct">, rules: EligibilityRule[]) {
+  const reasons: string[] = [];
+  for (const r of rules) {
+    const v = (n as any)[r.field] as boolean;
+    if (v !== r.mustBe) reasons.push(r.label);
+  }
+  return { eligible: reasons.length === 0, reasons };
+}
+
+function computeRoster(
+  tenant: Tenant,
+  pool: AnnualPool,
+  bands: TenureBand[],
+  rules: EligibilityRule[],
+  base: typeof DEMO_NURSES_BASE
+): Nurse[] {
+  // compute points and eligibility for active nurses (leave can be included w/ policy; here included but prorate could be applied)
+  const enriched = base.map((n) => {
+    const tenureYears = yearsBetween(n.hireDate, NOW);
+    const tenurePoints = getTenurePoints(tenureYears, bands);
+    const { eligible, reasons } = computeEligibility(n as any, rules);
+    return {
+      ...n,
+      tenureYears,
+      tenurePoints,
+      eligible,
+      eligibilityReasons: reasons,
+      sharePct: 0,
+      ltiAccruedThisYearJPY: 0,
+      ltiImmediateThisYearJPY: 0,
+      ltiDeferredThisYearJPY: 0,
+    } as Nurse;
+  });
+
+  // compute distribution only across eligible AND active/leave? (policy choice)
+  const eligibleForDistribution = enriched.filter((n) => n.eligible && (n.status === "active" || n.status === "leave"));
+  const totalPoints = eligibleForDistribution.reduce((acc, n) => acc + n.tenurePoints, 0) || 1;
+
+  // allocate annual pool by points (simple, per your direction). For cross-unit, still one person; FTE affects reporting (optional)
+  const totalPool = pool.approved ? pool.decidedPoolJPY : 0;
+  const immediatePool = Math.round((totalPool * pool.payoutMix.immediatePct) / 100);
+  const deferredPool = totalPool - immediatePool;
+
+  const updated = enriched.map((n) => {
+    if (!n.eligible || !(n.status === "active" || n.status === "leave")) {
+      return { ...n, sharePct: 0, ltiAccruedThisYearJPY: 0, ltiImmediateThisYearJPY: 0, ltiDeferredThisYearJPY: 0 };
+    }
+    const share = n.tenurePoints / totalPoints;
+    const accrued = Math.round(totalPool * share);
+    const immediate = Math.round(immediatePool * share);
+    const deferred = accrued - immediate;
+
+    return {
+      ...n,
+      sharePct: share,
+      ltiAccruedThisYearJPY: accrued,
+      ltiImmediateThisYearJPY: immediate,
+      ltiDeferredThisYearJPY: deferred,
+    };
+  });
+
+  return updated;
+}
+
+/* ----------------------------- Layout ----------------------------- */
+
+type NavKey =
+  | "client_dashboard"
+  | "client_setup_wizard"
+  | "client_policy"
+  | "client_roster"
+  | "client_approvals"
+  | "client_exports"
+  | "client_audit"
+  | "client_support"
+  | "nurse_home"
+  | "nurse_rules"
+  | "nurse_tickets"
+  | "operator_overview"
+  | "operator_tenants"
+  | "operator_security"
+  | "operator_integrations"
+  | "operator_templates"
+  | "operator_incident";
+
+function Topbar({
+  tenant,
+  role,
+  onRoleChange,
+  navTitle,
+}: {
+  tenant: Tenant;
+  role: Role;
+  onRoleChange: (r: Role) => void;
+  navTitle: string;
+}) {
+  return (
+    <div className="sticky top-0 z-10 border-b border-slate-200 bg-white/90 backdrop-blur">
+      <div className="mx-auto flex max-w-7xl items-center justify-between gap-4 px-4 py-3">
+        <div className="min-w-0">
+          <div className="flex items-center gap-2">
+            <div className="h-8 w-8 rounded-xl bg-slate-900" />
+            <div className="min-w-0">
+              <div className="truncate text-sm font-bold text-slate-900">{tenant.name}</div>
+              <div className="truncate text-xs text-slate-500">
+                {tenant.type === "hospital" ? "病院（医療機関）" : "訪問看護（事業者）"} ・ FY{tenant.fiscalYear} ・{" "}
+                {tenant.hasPHI ? <Badge tone="red">PHIあり（非推奨）</Badge> : <Badge tone="green">ゼロPHI（推奨）</Badge>}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        <div className="hidden md:block">
+          <div className="text-xs font-semibold text-slate-500">現在の画面</div>
+          <div className="text-sm font-bold text-slate-900">{navTitle}</div>
+        </div>
+
+        <div className="flex items-center gap-2">
+          <div className="hidden sm:block text-xs font-semibold text-slate-500">表示ロール</div>
+          <select
+            className="rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-900 outline-none focus:border-slate-400"
+            value={role}
+            onChange={(e) => onRoleChange(e.target.value as Role)}
+          >
+            <option value="client_admin">クライアント管理者</option>
+            <option value="client_payroll">クライアント給与担当</option>
+            <option value="client_viewer">クライアント閲覧のみ</option>
+            <option value="nurse">看護師（本人）</option>
+            <option value="operator">運営（ベンダー）</option>
+          </select>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function Sidebar({ role, nav, setNav }: { role: Role; nav: NavKey; setNav: (k: NavKey) => void }) {
+  const clientItems: Array<{ key: NavKey; label: string; hint: string }> = [
+    { key: "client_dashboard", label: "ダッシュボード", hint: "ゲート/原資/進捗" },
+    { key: "client_setup_wizard", label: "導入ウィザード", hint: "初期設定（最短導入）" },
+    { key: "client_policy", label: "制度ルール", hint: "勤続/ゲート/繰延" },
+    { key: "client_roster", label: "看護師名簿", hint: "対象判定/残高" },
+    { key: "client_approvals", label: "確定・承認", hint: "年度プール→支給" },
+    { key: "client_exports", label: "給与連携", hint: "CSV出力/履歴" },
+    { key: "client_audit", label: "監査ログ", hint: "説明責任の担保" },
+    { key: "client_support", label: "問い合わせ", hint: "異議申立て/FAQ" },
+  ];
+
+  const nurseItems: Array<{ key: NavKey; label: string; hint: string }> = [
+    { key: "nurse_home", label: "マイページ", hint: "見込み/残高" },
+    { key: "nurse_rules", label: "ルール", hint: "なぜこの金額か" },
+    { key: "nurse_tickets", label: "申立て", hint: "データ修正依頼" },
+  ];
+
+  const operatorItems: Array<{ key: NavKey; label: string; hint: string }> = [
+    { key: "operator_overview", label: "運用監視", hint: "全テナント状況" },
+    { key: "operator_tenants", label: "テナント管理", hint: "契約/権限" },
+    { key: "operator_security", label: "セキュリティ", hint: "監査/鍵/ログ" },
+    { key: "operator_integrations", label: "連携監視", hint: "CSV/API/失敗" },
+    { key: "operator_templates", label: "テンプレ", hint: "規程/指標" },
+    { key: "operator_incident", label: "インシデント", hint: "報告/対応" },
+  ];
+
+  const items = role === "nurse" ? nurseItems : role === "operator" ? operatorItems : clientItems;
+
+  return (
+    <div className="w-full md:w-72 md:shrink-0">
+      <div className="md:sticky md:top-[64px]">
+        <div className="rounded-2xl border border-slate-200 bg-white p-2 shadow-sm">
+          <div className="px-3 pb-2 pt-2">
+            <div className="text-xs font-semibold text-slate-500">メニュー</div>
+          </div>
+          <div className="space-y-1">
+            {items.map((it) => (
+              <button
+                key={it.key}
+                onClick={() => setNav(it.key)}
+                className={clsx(
+                  "w-full rounded-xl px-3 py-2 text-left transition",
+                  nav === it.key ? "bg-slate-900 text-white" : "bg-transparent hover:bg-slate-100"
+                )}
+              >
+                <div className={clsx("text-sm font-semibold", nav === it.key ? "text-white" : "text-slate-900")}>{it.label}</div>
+                <div className={clsx("text-xs", nav === it.key ? "text-white/80" : "text-slate-500")}>{it.hint}</div>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        <div className="mt-3 rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+          <div className="text-xs font-semibold text-slate-500">設計ポリシー</div>
+          <div className="mt-2 space-y-2 text-xs text-slate-600">
+            <div className="flex items-center justify-between">
+              <span>患者個票</span>
+              <Badge tone="green">扱わない</Badge>
+            </div>
+            <div className="flex items-center justify-between">
+              <span>支給確定</span>
+              <Badge tone="blue">顧客が承認</Badge>
+            </div>
+            <div className="flex items-center justify-between">
+              <span>個人評価</span>
+              <Badge tone="gray">最小（遵守）</Badge>
+            </div>
+            <div className="text-[11px] text-slate-500">
+              ※医療法人向けは「利益按分」ではなく「財務健全性ゲート＋決議＋キャップ」で説明できる設計にする。
+            </div>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ----------------------------- Screens: Client ----------------------------- */
+
+function GatePill({ status, label }: { status: GateStatus; label: string }) {
+  const tone = status === "pass" ? "green" : status === "warn" ? "yellow" : "red";
+  const text = status === "pass" ? "クリア" : status === "warn" ? "注意" : "未達";
+  return (
+    <div className="flex items-center justify-between rounded-xl border border-slate-200 bg-white p-3">
+      <div>
+        <div className="text-xs font-semibold text-slate-500">{label}</div>
+        <div className="text-sm font-bold text-slate-900">{text}</div>
+      </div>
+      <Badge tone={tone as any}>{text}</Badge>
+    </div>
+  );
+}
+
+function ClientDashboard({
+  tenant,
+  pool,
+  finGate,
+  safetyGate,
+  roster,
+  openSetup,
+}: {
+  tenant: Tenant;
+  pool: AnnualPool;
+  finGate: FinancialGate;
+  safetyGate: SafetyGate;
+  roster: Nurse[];
+  openSetup: () => void;
+}) {
+  const eligibleCount = roster.filter((n) => n.eligible && (n.status === "active" || n.status === "leave")).length;
+  const totalCount = roster.filter((n) => n.status === "active" || n.status === "leave").length;
+  const ineligibleCount = totalCount - eligibleCount;
+  const topMissing = useMemo(() => {
+    const map = new Map<string, number>();
+    roster.forEach((n) => n.eligibilityReasons.forEach((r) => map.set(r, (map.get(r) || 0) + 1)));
+    return [...map.entries()].sort((a, b) => b[1] - a[1]).slice(0, 3);
+  }, [roster]);
+
+  const totalDeferred = roster.reduce((acc, n) => acc + n.ltiDeferredThisYearJPY, 0);
+  const totalImmediate = roster.reduce((acc, n) => acc + n.ltiImmediateThisYearJPY, 0);
+
+  return (
+    <div className="space-y-4">
+      <Card>
+        <CardHeader
+          title="ダッシュボード"
+          subtitle="年度プール・ゲート・対象者状況を一画面で。ゼロPHI（患者個票なし）で運用可能。"
+          right={<Button variant="secondary" onClick={openSetup}>導入ウィザードを開く</Button>}
+        />
+        <CardBody>
+          <div className="grid gap-3 md:grid-cols-4">
+            <GatePill status={finGate.enabled ? finGate.status : "pass"} label="財務健全性ゲート" />
+            <GatePill status={safetyGate.enabled ? safetyGate.status : "pass"} label="品質・安全ゲート" />
+            <div className="rounded-xl border border-slate-200 bg-white p-3">
+              <div className="text-xs font-semibold text-slate-500">年度プール（決議済）</div>
+              <div className="mt-1 text-lg font-extrabold text-slate-900">{fmtJPY(pool.decidedPoolJPY)}</div>
+              <div className="mt-1 text-xs text-slate-500">即時 {pool.payoutMix.immediatePct}% ／ 繰延 {pool.payoutMix.deferredPct}%</div>
+            </div>
+            <div className="rounded-xl border border-slate-200 bg-white p-3">
+              <div className="text-xs font-semibold text-slate-500">対象者（在籍）</div>
+              <div className="mt-1 flex items-center gap-2">
+                <div className="text-lg font-extrabold text-slate-900">{eligibleCount}/{totalCount}</div>
+                <Badge tone={ineligibleCount === 0 ? "green" : "yellow"}>{ineligibleCount === 0 ? "全員OK" : `対象外 ${ineligibleCount}名`}</Badge>
+              </div>
+              <div className="mt-1 text-xs text-slate-500">対象外理由：研修未完了・記録未達 等</div>
+            </div>
+          </div>
+
+          <Divider />
+
+          <div className="grid gap-4 md:grid-cols-2">
+            <Card>
+              <CardHeader title="支給見込み（今年度）" subtitle="確定はクライアントが承認します（責任分界）。" />
+              <CardBody>
+                <div className="grid grid-cols-2 gap-3">
+                  <div className="rounded-xl border border-slate-200 bg-white p-3">
+                    <div className="text-xs font-semibold text-slate-500">即時支給 合計</div>
+                    <div className="mt-1 text-lg font-extrabold text-slate-900">{fmtJPY(totalImmediate)}</div>
+                  </div>
+                  <div className="rounded-xl border border-slate-200 bg-white p-3">
+                    <div className="text-xs font-semibold text-slate-500">繰延付与 合計</div>
+                    <div className="mt-1 text-lg font-extrabold text-slate-900">{fmtJPY(totalDeferred)}</div>
+                  </div>
+                </div>
+                <div className="mt-3 rounded-xl bg-slate-50 p-3 text-xs text-slate-600">
+                  ここでの“繰延付与”は、本人ごとのLTI残高に計上されます（例：3年繰延）。退職時の扱いは規程の Good/Bad leaver に従います。
+                </div>
+              </CardBody>
+            </Card>
+
+            <Card>
+              <CardHeader title="対象外の主因（上位）" subtitle="制度の“納得感”は、対象資格（ゲート）の透明性で担保します。" />
+              <CardBody>
+                {topMissing.length === 0 ? (
+                  <div className="text-sm text-slate-500">対象外はありません。</div>
+                ) : (
+                  <div className="space-y-2">
+                    {topMissing.map(([reason, count]) => (
+                      <div key={reason} className="flex items-center justify-between rounded-xl border border-slate-200 p-3">
+                        <div className="text-sm font-semibold text-slate-900">{reason}</div>
+                        <Badge tone="yellow">{count}名</Badge>
+                      </div>
+                    ))}
+                  </div>
+                )}
+                <div className="mt-3 text-xs text-slate-500">
+                  UXのコツ：看護師本人画面で「何を満たせば対象になるか」を明確にし、比較（順位付け）は出さない（分断防止）。
+                </div>
+              </CardBody>
+            </Card>
+          </div>
+        </CardBody>
+      </Card>
+    </div>
+  );
+}
+
+function SetupWizard({
+  pool,
+  setPool,
+  finGate,
+  setFinGate,
+  safetyGate,
+  setSafetyGate,
+  bands,
+  setBands,
+  rules,
+  setRules,
+  addAudit,
+}: {
+  pool: AnnualPool;
+  setPool: (p: AnnualPool) => void;
+  finGate: FinancialGate;
+  setFinGate: (g: FinancialGate) => void;
+  safetyGate: SafetyGate;
+  setSafetyGate: (g: SafetyGate) => void;
+  bands: TenureBand[];
+  setBands: (b: TenureBand[]) => void;
+  rules: EligibilityRule[];
+  setRules: (r: EligibilityRule[]) => void;
+  addAudit: (a: AuditLog) => void;
+}) {
+  const [step, setStep] = useState(1);
+
+  const progress = [
+    { n: 1, title: "年度プール" },
+    { n: 2, title: "ゲート設定" },
+    { n: 3, title: "勤続ポイント" },
+    { n: 4, title: "対象資格（遵守）" },
+    { n: 5, title: "確認・有効化" },
+  ];
+
+  function saveStep(msg: string) {
+    addAudit({
+      at: new Date().toISOString(),
+      actor: "クライアント管理者",
+      action: "wizard_save",
+      scope: "policy",
+      details: msg,
+    });
+  }
+
+  return (
+    <Card>
+      <CardHeader
+        title="導入ウィザード（最短で“運用できる”状態へ）"
+        subtitle="評価を複雑化しない。勤続＋遵守ゲート＋年次プール＋繰延残高を、医療機関で通る形でセットアップ。"
+        right={
+          <div className="flex items-center gap-2">
+            <Button variant="secondary" onClick={() => setStep((s) => Math.max(1, s - 1))} disabled={step === 1}>
+              戻る
+            </Button>
+            <Button onClick={() => setStep((s) => Math.min(5, s + 1))} disabled={step === 5}>
+              次へ
+            </Button>
+          </div>
+        }
+      />
+      <CardBody>
+        <div className="grid gap-4 md:grid-cols-4">
+          <div className="md:col-span-1">
+            <div className="space-y-2">
+              {progress.map((p) => (
+                <button
+                  key={p.n}
+                  onClick={() => setStep(p.n)}
+                  className={clsx(
+                    "w-full rounded-xl border p-3 text-left transition",
+                    step === p.n ? "border-slate-900 bg-slate-900 text-white" : "border-slate-200 bg-white hover:bg-slate-50"
+                  )}
+                >
+                  <div className={clsx("text-xs font-semibold", step === p.n ? "text-white/80" : "text-slate-500")}>STEP {p.n}</div>
+                  <div className={clsx("text-sm font-bold", step === p.n ? "text-white" : "text-slate-900")}>{p.title}</div>
+                </button>
+              ))}
+            </div>
+            <div className="mt-3 rounded-xl bg-slate-50 p-3 text-xs text-slate-600">
+              ヒント：医療法人向けは「利益配分」表現を避け、<b>財務健全性ゲート＋決議＋キャップ</b>で「支払能力の範囲での報酬（給与改善枠）」として説明可能にします。
+            </div>
+          </div>
+
+          <div className="md:col-span-3">
+            {step === 1 ? (
+              <div className="space-y-4">
+                <SectionTitle title="年度プール（原資）の設定" hint="最終確定（承認）は顧客側。ベンダーは計算・証跡・透明性を提供。" />
+                <div className="grid gap-3 md:grid-cols-2">
+                  <Input
+                    label="年度プール額（JPY）"
+                    type="number"
+                    value={pool.decidedPoolJPY}
+                    onChange={(v) => setPool({ ...pool, decidedPoolJPY: Math.max(0, parseInt(v || "0", 10)) })}
+                    help="※会計上/資金繰り上の安全性を確保した範囲で決定。利益按分ではなく“支払能力”として説明。"
+                  />
+                  <div className="space-y-2">
+                    <div className="rounded-xl border border-slate-200 p-3">
+                      <div className="text-xs font-semibold text-slate-500">キャップ（上限）</div>
+                      <div className="mt-2 flex items-center gap-2">
+                        <select
+                          className="w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-900 outline-none focus:border-slate-400"
+                          value={pool.capPolicy.mode}
+                          onChange={(e) => setPool({ ...pool, capPolicy: { ...pool.capPolicy, mode: e.target.value as any } })}
+                        >
+                          <option value="pct_payroll">看護職人件費の%</option>
+                          <option value="fixed">固定額（JPY）</option>
+                        </select>
+                        <input
+                          className="w-32 rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-900 outline-none focus:border-slate-400"
+                          value={pool.capPolicy.value}
+                          onChange={(e) => setPool({ ...pool, capPolicy: { ...pool.capPolicy, value: parseFloat(e.target.value || "0") } })}
+                        />
+                      </div>
+                      <div className="mt-1 text-xs text-slate-500">例：2%（0.02） / 固定額 10,000,000</div>
+                    </div>
+                    <div className="rounded-xl border border-slate-200 p-3">
+                      <div className="text-xs font-semibold text-slate-500">支給ミックス</div>
+                      <div className="mt-2 grid grid-cols-2 gap-2">
+                        <Input
+                          label="即時支給（%）"
+                          type="number"
+                          value={pool.payoutMix.immediatePct}
+                          onChange={(v) => {
+                            const im = Math.min(100, Math.max(0, parseInt(v || "0", 10)));
+                            setPool({ ...pool, payoutMix: { immediatePct: im, deferredPct: 100 - im } });
+                          }}
+                          help="即時と繰延の合計=100"
+                        />
+                        <Input label="繰延（%）" type="number" value={pool.payoutMix.deferredPct} onChange={() => {}} help="自動計算" />
+                      </div>
+                      <div className="mt-2 rounded-xl bg-slate-50 p-2 text-xs text-slate-600">
+                        例：即時25%／繰延75%（資金繰り安定＋定着インパクト）。
+                      </div>
+                    </div>
+                  </div>
+                </div>
+
+                <div className="flex items-center justify-between rounded-xl border border-slate-200 p-3">
+                  <div>
+                    <div className="text-sm font-semibold text-slate-900">プールを「決議済」にする</div>
+                    <div className="text-xs text-slate-500">本番では承認ワークフロー（経営会議/理事会）＋監査ログが必須。</div>
+                  </div>
+                  <Button
+                    onClick={() => {
+                      const trail = [...pool.approvalTrail, { at: new Date().toISOString().slice(0, 10), by: "経営会議（デモ）", action: pool.approved ? "reopened" : "approved" }];
+                      setPool({ ...pool, approved: !pool.approved, approvalTrail: trail });
+                      saveStep(pool.approved ? "Annual pool reopened" : "Annual pool approved");
+                    }}
+                    variant={pool.approved ? "secondary" : "primary"}
+                  >
+                    {pool.approved ? "承認を取り消す" : "承認する"}
+                  </Button>
+                </div>
+              </div>
+            ) : null}
+
+            {step === 2 ? (
+              <div className="space-y-4">
+                <SectionTitle title="ゲート設定（支給の有無を決める）" hint="“利益が出たら配る”ではなく、財務健全性と品質・安全のゲートで説明可能にする。" />
+                <div className="grid gap-3 md:grid-cols-2">
+                  <Toggle
+                    label="財務健全性ゲート"
+                    enabled={finGate.enabled}
+                    onChange={(v) => setFinGate({ ...finGate, enabled: v })}
+                    help="例：資金繰り（現預金◯ヶ月）や収支状況が基準未達なら当年度プール=0。"
+                  />
+                  <Toggle
+                    label="品質・安全ゲート"
+                    enabled={safetyGate.enabled}
+                    onChange={(v) => setSafetyGate({ ...safetyGate, enabled: v })}
+                    help="例：重大インシデント/請求不正/隠蔽があれば当年度は支給停止。逆インセンティブ対策。"
+                  />
+                </div>
+                <div className="grid gap-3 md:grid-cols-2">
+                  <Card>
+                    <CardHeader title="財務健全性（デモ入力）" subtitle="本番では会計データは最小化し、判定結果のみ連携も可。" />
+                    <CardBody>
+                      <div className="grid gap-2">
+                        <Input
+                          label="現預金月数（例）"
+                          type="number"
+                          value={finGate.cashMonths ?? 0}
+                          onChange={(v) => setFinGate({ ...finGate, cashMonths: parseFloat(v || "0") })}
+                        />
+                        <Input
+                          label="営業利益率（% 例）"
+                          type="number"
+                          value={finGate.operatingMarginPct ?? 0}
+                          onChange={(v) => setFinGate({ ...finGate, operatingMarginPct: parseFloat(v || "0") })}
+                        />
+                        <label className="block">
+                          <div className="text-xs font-semibold text-slate-700">判定</div>
+                          <select
+                            className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-900 outline-none focus:border-slate-400"
+                            value={finGate.status}
+                            onChange={(e) => setFinGate({ ...finGate, status: e.target.value as GateStatus })}
+                          >
+                            <option value="pass">クリア</option>
+                            <option value="warn">注意</option>
+                            <option value="fail">未達（支給なし/減額）</option>
+                          </select>
+                        </label>
+                        <Input label="メモ（説明用）" value={finGate.note} onChange={(v) => setFinGate({ ...finGate, note: v })} />
+                      </div>
+                      <div className="mt-3 rounded-xl bg-slate-50 p-3 text-xs text-slate-600">
+                        ここは「患者情報」と無関係。システムには“判定（Pass/Warn/Fail）と説明文”のみ入れる設計も可能。
+                      </div>
+                    </CardBody>
+                  </Card>
+
+                  <Card>
+                    <CardHeader title="品質・安全（デモ入力）" subtitle="医療の価値を壊さないための強い安全弁。" />
+                    <CardBody>
+                      <div className="grid gap-2">
+                        <Input
+                          label="重大インシデント件数（例）"
+                          type="number"
+                          value={safetyGate.majorIncidentCount ?? 0}
+                          onChange={(v) => setSafetyGate({ ...safetyGate, majorIncidentCount: parseInt(v || "0", 10) })}
+                        />
+                        <label className="block">
+                          <div className="text-xs font-semibold text-slate-700">請求コンプラ重大フラグ</div>
+                          <select
+                            className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-900 outline-none focus:border-slate-400"
+                            value={String(!!safetyGate.complianceFlag)}
+                            onChange={(e) => setSafetyGate({ ...safetyGate, complianceFlag: e.target.value === "true" })}
+                          >
+                            <option value="false">なし</option>
+                            <option value="true">あり（支給停止候補）</option>
+                          </select>
+                        </label>
+                        <label className="block">
+                          <div className="text-xs font-semibold text-slate-700">判定</div>
+                          <select
+                            className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-900 outline-none focus:border-slate-400"
+                            value={safetyGate.status}
+                            onChange={(e) => setSafetyGate({ ...safetyGate, status: e.target.value as GateStatus })}
+                          >
+                            <option value="pass">クリア</option>
+                            <option value="warn">注意</option>
+                            <option value="fail">未達（支給停止）</option>
+                          </select>
+                        </label>
+                        <Input label="メモ（説明用）" value={safetyGate.note} onChange={(v) => setSafetyGate({ ...safetyGate, note: v })} />
+                      </div>
+                      <div className="mt-3 rounded-xl bg-slate-50 p-3 text-xs text-slate-600">
+                        逆インセンティブ対策：量ではなく「安全・コンプラ」をゲートにして、過剰・不適切な行動の動機を消す。
+                      </div>
+                    </CardBody>
+                  </Card>
+                </div>
+
+                <div className="flex justify-end">
+                  <Button
+                    variant="secondary"
+                    onClick={() => {
+                      saveStep("Gate settings updated");
+                    }}
+                  >
+                    このステップを保存
+                  </Button>
+                </div>
+              </div>
+            ) : null}
+
+            {step === 3 ? (
+              <div className="space-y-4">
+                <SectionTitle title="勤続ポイント（評価の代替）" hint="能力評価をしない代わりに、勤続年数の段階で分配。S字＋頭打ちで原資膨張を防ぐ。" />
+                <div className="rounded-xl border border-slate-200 bg-white p-3">
+                  <div className="text-xs text-slate-600">
+                    例：1-2年は小さく、3-5年を厚く、6年以降は頭打ち。退職が多いゾーンで効かせる。
+                  </div>
+                </div>
+                <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white">
+                  <table className="w-full text-sm">
+                    <thead className="bg-slate-50 text-xs text-slate-600">
+                      <tr>
+                        <th className="px-3 py-2 text-left">勤続（年以上）</th>
+                        <th className="px-3 py-2 text-left">勤続（未満）</th>
+                        <th className="px-3 py-2 text-left">ポイント</th>
+                        <th className="px-3 py-2 text-right">操作</th>
+                      </tr>
+                    </thead>
+                    <tbody>
+                      {bands.map((b, idx) => (
+                        <tr key={idx} className="border-t border-slate-100">
+                          <td className="px-3 py-2">
+                            <input
+                              className="w-24 rounded-xl border border-slate-200 px-2 py-1 text-sm"
+                              value={b.minYears}
+                              onChange={(e) => {
+                                const v = parseFloat(e.target.value || "0");
+                                const next = [...bands];
+                                next[idx] = { ...next[idx], minYears: v };
+                                setBands(next);
+                              }}
+                            />
+                          </td>
+                          <td className="px-3 py-2">
+                            {b.maxYears == null ? (
+                              <Badge tone="gray">∞</Badge>
+                            ) : (
+                              <input
+                                className="w-24 rounded-xl border border-slate-200 px-2 py-1 text-sm"
+                                value={b.maxYears}
+                                onChange={(e) => {
+                                  const v = parseFloat(e.target.value || "0");
+                                  const next = [...bands];
+                                  next[idx] = { ...next[idx], maxYears: v };
+                                  setBands(next);
+                                }}
+                              />
+                            )}
+                          </td>
+                          <td className="px-3 py-2">
+                            <input
+                              className="w-24 rounded-xl border border-slate-200 px-2 py-1 text-sm"
+                              value={b.points}
+                              onChange={(e) => {
+                                const v = parseInt(e.target.value || "0", 10);
+                                const next = [...bands];
+                                next[idx] = { ...next[idx], points: v };
+                                setBands(next);
+                              }}
+                            />
+                          </td>
+                          <td className="px-3 py-2 text-right">
+                            <Button
+                              variant="ghost"
+                              onClick={() => {
+                                const next = bands.filter((_, i) => i !== idx);
+                                setBands(next);
+                              }}
+                            >
+                              削除
+                            </Button>
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <Button
+                    variant="secondary"
+                    onClick={() => setBands([...bands, { minYears: 6, maxYears: null, points: 6 }])}
+                    title="末尾に追加（必要に応じて調整）"
+                  >
+                    行を追加
+                  </Button>
+                  <Button
+                    variant="secondary"
+                    onClick={() => {
+                      saveStep("Tenure bands updated");
+                    }}
+                  >
+                    このステップを保存
+                  </Button>
+                </div>
+              </div>
+            ) : null}
+
+            {step === 4 ? (
+              <div className="space-y-4">
+                <SectionTitle title="対象資格（遵守ゲート）" hint="“サボる人も同じ”を評価で罰せず、支給資格の要件で処理。Yes/Noで透明に。" />
+                <div className="space-y-3">
+                  {rules.map((r) => (
+                    <div key={r.id} className="rounded-2xl border border-slate-200 bg-white p-4">
+                      <div className="flex items-start justify-between gap-3">
+                        <div>
+                          <div className="text-sm font-bold text-slate-900">{r.label}</div>
+                          <div className="mt-1 text-xs text-slate-600">{r.description}</div>
+                          <div className="mt-2 flex items-center gap-2 text-xs text-slate-600">
+                            <Badge tone="gray">判定フィールド</Badge>
+                            <span className="font-mono">{r.field}</span>
+                            <Badge tone="blue">必須</Badge>
+                            <span>mustBe={String(r.mustBe)}</span>
+                          </div>
+                        </div>
+                        <Button
+                          variant="ghost"
+                          onClick={() => {
+                            setRules(rules.filter((x) => x.id !== r.id));
+                          }}
+                        >
+                          削除
+                        </Button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="flex items-center justify-between">
+                  <Button
+                    variant="secondary"
+                    onClick={() => {
+                      const id = `r${Math.floor(Math.random() * 10000)}`;
+                      setRules([
+                        ...rules,
+                        {
+                          id,
+                          label: "（新規）条件名を編集してください",
+                          description: "説明文を編集してください。",
+                          field: "requiredTrainingComplete",
+                          mustBe: true,
+                        },
+                      ]);
+                    }}
+                  >
+                    条件を追加
+                  </Button>
+                  <Button
+                    variant="secondary"
+                    onClick={() => {
+                      saveStep("Eligibility rules updated");
+                    }}
+                  >
+                    このステップを保存
+                  </Button>
+                </div>
+
+                <div className="rounded-2xl border border-slate-200 bg-slate-50 p-4 text-xs text-slate-700">
+                  <div className="font-semibold">推奨（医療機関で通しやすい最小セット）</div>
+                  <ul className="mt-2 list-disc space-y-1 pl-5">
+                    <li>必須研修（安全・感染・個人情報）完了</li>
+                    <li>重大な懲戒・服務違反なし</li>
+                    <li>記録期限遵守（最低ライン）</li>
+                    <li>無断欠勤・重大遅刻が規程上限以内</li>
+                  </ul>
+                </div>
+              </div>
+            ) : null}
+
+            {step === 5 ? (
+              <div className="space-y-4">
+                <SectionTitle title="確認・有効化" hint="ルールブック（規程骨子）として説明可能な状態にし、承認フローで確定。" />
+
+                <div className="grid gap-3 md:grid-cols-2">
+                  <Card>
+                    <CardHeader title="サマリ" subtitle="制度の“通りやすさ”は、単純さ＋透明性＋ゲート。" />
+                    <CardBody>
+                      <div className="space-y-2 text-sm">
+                        <div className="flex items-center justify-between">
+                          <span className="text-slate-600">年度プール</span>
+                          <span className="font-bold text-slate-900">{fmtJPY(pool.decidedPoolJPY)}</span>
+                        </div>
+                        <div className="flex items-center justify-between">
+                          <span className="text-slate-600">支給ミックス</span>
+                          <span className="font-bold text-slate-900">
+                            即時 {pool.payoutMix.immediatePct}% / 繰延 {pool.payoutMix.deferredPct}%
+                          </span>
+                        </div>
+                        <div className="flex items-center justify-between">
+                          <span className="text-slate-600">繰延方式</span>
+                          <span className="font-bold text-slate-900">{pool.deferralPolicy.mode}</span>
+                        </div>
+                        <div className="flex items-center justify-between">
+                          <span className="text-slate-600">ゲート</span>
+                          <span className="font-bold text-slate-900">
+                            財務 {finGate.enabled ? finGate.status : "off"} / 安全 {safetyGate.enabled ? safetyGate.status : "off"}
+                          </span>
+                        </div>
+                        <div className="flex items-center justify-between">
+                          <span className="text-slate-600">勤続帯</span>
+                          <span className="font-bold text-slate-900">{bands.length}件</span>
+                        </div>
+                        <div className="flex items-center justify-between">
+                          <span className="text-slate-600">対象資格</span>
+                          <span className="font-bold text-slate-900">{rules.length}件</span>
+                        </div>
+                      </div>
+                    </CardBody>
+                  </Card>
+
+                  <Card>
+                    <CardHeader title="有効化チェック" subtitle="このまま提案資料に載せられる粒度を想定。" />
+                    <CardBody>
+                      <div className="space-y-2 text-sm text-slate-700">
+                        <div className="flex items-center gap-2">
+                          <Badge tone={pool.approved ? "green" : "yellow"}>{pool.approved ? "OK" : "未承認"}</Badge>
+                          <span>年度プールが承認済</span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <Badge tone={rules.length >= 3 ? "green" : "yellow"}>{rules.length >= 3 ? "OK" : "要検討"}</Badge>
+                          <span>対象資格（遵守）が最低限揃っている</span>
+                        </div>
+                        <div className="flex items-center gap-2">
+                          <Badge tone={bands.length >= 4 ? "green" : "yellow"}>{bands.length >= 4 ? "OK" : "要検討"}</Badge>
+                          <span>勤続ポイントが段階設計されている</span>
+                        </div>
+                        <div className="rounded-xl bg-slate-50 p-3 text-xs text-slate-600">
+                          最終的には「規程（条文）」「説明資料（FAQ）」「承認記録（議事録）」の3点セットが必要です。本UIはその下地です。
+                        </div>
+                        <Button
+                          onClick={() => {
+                            addAudit({
+                              at: new Date().toISOString(),
+                              actor: "クライアント管理者",
+                              action: "policy_activated",
+                              scope: "policy",
+                              details: "Policy activated (demo).",
+                            });
+                            alert("（デモ）ポリシーを有効化しました。");
+                          }}
+                          disabled={!pool.approved}
+                        >
+                          有効化（デモ）
+                        </Button>
+                      </div>
+                    </CardBody>
+                  </Card>
+                </div>
+              </div>
+            ) : null}
+          </div>
+        </div>
+      </CardBody>
+    </Card>
+  );
+}
+
+function ClientPolicy({ pool, finGate, safetyGate, bands, rules }: { pool: AnnualPool; finGate: FinancialGate; safetyGate: SafetyGate; bands: TenureBand[]; rules: EligibilityRule[] }) {
+  return (
+    <div className="space-y-4">
+      <Card>
+        <CardHeader title="制度ルール（ルールブック）" subtitle="医療機関向けの説明責任を満たすため、式と例外を“見える化”します。" />
+        <CardBody>
+          <div className="grid gap-4 md:grid-cols-2">
+            <div className="rounded-2xl border border-slate-200 p-4">
+              <div className="text-sm font-bold text-slate-900">1) 原資（年度プール）</div>
+              <div className="mt-2 text-sm text-slate-700">
+                年度ごとに、財務健全性ゲートと品質・安全ゲートを確認のうえ、上限（キャップ）内でプールを決議する。
+              </div>
+              <div className="mt-3 space-y-2 text-sm">
+                <div className="flex items-center justify-between">
+                  <span className="text-slate-600">プール</span>
+                  <span className="font-bold">{fmtJPY(pool.decidedPoolJPY)}</span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-slate-600">キャップ</span>
+                  <span className="font-bold">
+                    {pool.capPolicy.mode === "pct_payroll" ? `${fmtPct(pool.capPolicy.value)}（人件費比）` : fmtJPY(pool.capPolicy.value)}
+                  </span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-slate-600">即時/繰延</span>
+                  <span className="font-bold">
+                    {pool.payoutMix.immediatePct}% / {pool.payoutMix.deferredPct}%
+                  </span>
+                </div>
+                <div className="flex items-center justify-between">
+                  <span className="text-slate-600">繰延方式</span>
+                  <span className="font-bold">{pool.deferralPolicy.mode}</span>
+                </div>
+              </div>
+              <div className="mt-3 rounded-xl bg-slate-50 p-3 text-xs text-slate-600">
+                「利益が出たら配る」ではなく「支払能力（健全性）を満たす年度に限り、給与改善枠として決議する」という説明に寄せる。
+              </div>
+            </div>
+
+            <div className="rounded-2xl border border-slate-200 p-4">
+              <div className="text-sm font-bold text-slate-900">2) ゲート</div>
+              <div className="mt-2 space-y-2 text-sm text-slate-700">
+                <div className="rounded-xl border border-slate-200 p-3">
+                  <div className="flex items-center justify-between">
+                    <span className="font-semibold">財務健全性</span>
+                    <Badge tone={finGate.status === "pass" ? "green" : finGate.status === "warn" ? "yellow" : "red"}>{finGate.status}</Badge>
+                  </div>
+                  <div className="mt-1 text-xs text-slate-500">{finGate.note}</div>
+                </div>
+                <div className="rounded-xl border border-slate-200 p-3">
+                  <div className="flex items-center justify-between">
+                    <span className="font-semibold">品質・安全</span>
+                    <Badge tone={safetyGate.status === "pass" ? "green" : safetyGate.status === "warn" ? "yellow" : "red"}>{safetyGate.status}</Badge>
+                  </div>
+                  <div className="mt-1 text-xs text-slate-500">{safetyGate.note}</div>
+                </div>
+              </div>
+            </div>
+
+            <div className="rounded-2xl border border-slate-200 p-4">
+              <div className="text-sm font-bold text-slate-900">3) 分配（勤続ポイント）</div>
+              <div className="mt-2 text-sm text-slate-700">
+                個人の能力評価は原則行わず、勤続年数帯のポイントで分配する。S字＋頭打ちで原資膨張を防ぐ。
+              </div>
+              <div className="mt-3 overflow-hidden rounded-xl border border-slate-200">
+                <table className="w-full text-xs">
+                  <thead className="bg-slate-50 text-slate-600">
+                    <tr>
+                      <th className="px-3 py-2 text-left">勤続</th>
+                      <th className="px-3 py-2 text-left">ポイント</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {bands.map((b, i) => (
+                      <tr key={i} className="border-t border-slate-100">
+                        <td className="px-3 py-2 text-slate-700">
+                          {b.minYears}年以上 {b.maxYears == null ? "" : `${b.maxYears}年未満`}
+                        </td>
+                        <td className="px-3 py-2 font-semibold text-slate-900">{b.points}</td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            </div>
+
+            <div className="rounded-2xl border border-slate-200 p-4">
+              <div className="text-sm font-bold text-slate-900">4) 対象資格（遵守ゲート）</div>
+              <div className="mt-2 text-sm text-slate-700">対象資格を満たさない場合は当年度の支給対象外（透明・客観・Yes/No）。</div>
+              <div className="mt-3 space-y-2">
+                {rules.map((r) => (
+                  <div key={r.id} className="rounded-xl border border-slate-200 p-3">
+                    <div className="flex items-center justify-between">
+                      <div className="text-sm font-semibold text-slate-900">{r.label}</div>
+                      <Badge tone="blue">必須</Badge>
+                    </div>
+                    <div className="mt-1 text-xs text-slate-500">{r.description}</div>
+                  </div>
+                ))}
+              </div>
+            </div>
+          </div>
+
+          <Divider />
+
+          <div className="rounded-2xl bg-slate-50 p-4 text-xs text-slate-700">
+            <div className="font-semibold">セキュリティ/法務の前提（提案資料用）</div>
+            <ul className="mt-2 list-disc space-y-1 pl-5">
+              <li>患者個票は扱わず、満足度などは部署別の集計値のみ（n閾値）</li>
+              <li>職員データは必要最小限（勤怠・研修・記録遵守・服務フラグ）</li>
+              <li>支給確定は顧客の承認ワークフローを必須化（責任分界）</li>
+              <li>監査ログ、アクセス制御（RBAC）、暗号化、削除/保持ポリシーを明記</li>
+            </ul>
+          </div>
+        </CardBody>
+      </Card>
+    </div>
+  );
+}
+
+function RosterTable({ roster, onSelect }: { roster: Nurse[]; onSelect: (id: string) => void }) {
+  return (
+    <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white">
+      <table className="w-full text-sm">
+        <thead className="bg-slate-50 text-xs text-slate-600">
+          <tr>
+            <th className="px-3 py-2 text-left">氏名</th>
+            <th className="px-3 py-2 text-left">所属</th>
+            <th className="px-3 py-2 text-left">勤続</th>
+            <th className="px-3 py-2 text-left">対象</th>
+            <th className="px-3 py-2 text-right">今年（即時）</th>
+            <th className="px-3 py-2 text-right">今年（繰延）</th>
+            <th className="px-3 py-2 text-right">繰延残高</th>
+          </tr>
+        </thead>
+        <tbody>
+          {roster.map((n) => (
+            <tr key={n.id} className="border-t border-slate-100 hover:bg-slate-50">
+              <td className="px-3 py-2">
+                <button className="text-left" onClick={() => onSelect(n.id)}>
+                  <div className="font-semibold text-slate-900">{n.name}</div>
+                  <div className="text-xs text-slate-500">{n.employeeId} {n.crossUnit ? <Badge tone="gray">横断</Badge> : null}</div>
+                </button>
+              </td>
+              <td className="px-3 py-2 text-slate-700">{n.unit}</td>
+              <td className="px-3 py-2 text-slate-700">
+                {n.tenureYears.toFixed(1)}年 <span className="text-xs text-slate-500">（pt:{n.tenurePoints}）</span>
+              </td>
+              <td className="px-3 py-2">
+                {n.eligible ? <Badge tone="green">対象</Badge> : <Badge tone="yellow">対象外</Badge>}
+              </td>
+              <td className="px-3 py-2 text-right font-semibold text-slate-900">{fmtJPY(n.ltiImmediateThisYearJPY)}</td>
+              <td className="px-3 py-2 text-right font-semibold text-slate-900">{fmtJPY(n.ltiDeferredThisYearJPY)}</td>
+              <td className="px-3 py-2 text-right font-semibold text-slate-900">{fmtJPY(n.ltiBalanceJPY)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+    </div>
+  );
+}
+
+function NurseDetail({ nurse }: { nurse: Nurse }) {
+  return (
+    <Card>
+      <CardHeader
+        title={`看護師詳細：${nurse.name}`}
+        subtitle="対象判定の透明性と、本人説明（なぜこの金額か）をそのまま作るための画面。"
+        right={<Badge tone={nurse.eligible ? "green" : "yellow"}>{nurse.eligible ? "対象" : "対象外"}</Badge>}
+      />
+      <CardBody>
+        <div className="grid gap-4 md:grid-cols-2">
+          <div>
+            <SectionTitle title="基本情報" />
+            <div className="space-y-2 text-sm">
+              <div className="flex items-center justify-between rounded-xl border border-slate-200 p-3">
+                <span className="text-slate-600">職員ID</span>
+                <span className="font-semibold">{nurse.employeeId}</span>
+              </div>
+              <div className="flex items-center justify-between rounded-xl border border-slate-200 p-3">
+                <span className="text-slate-600">所属</span>
+                <span className="font-semibold">{nurse.unit}</span>
+              </div>
+              <div className="flex items-center justify-between rounded-xl border border-slate-200 p-3">
+                <span className="text-slate-600">勤続</span>
+                <span className="font-semibold">{nurse.tenureYears.toFixed(1)}年（pt:{nurse.tenurePoints}）</span>
+              </div>
+              <div className="flex items-center justify-between rounded-xl border border-slate-200 p-3">
+                <span className="text-slate-600">雇用状態</span>
+                <span className="font-semibold">{nurse.status}</span>
+              </div>
+              <div className="rounded-xl border border-slate-200 p-3">
+                <div className="text-xs font-semibold text-slate-500">役割タグ</div>
+                <div className="mt-2 flex flex-wrap gap-2">
+                  {nurse.roleTags.length ? nurse.roleTags.map((t) => <Badge key={t} tone="blue">{t}</Badge>) : <Badge tone="gray">なし</Badge>}
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <div>
+            <SectionTitle title="対象資格（遵守ゲート）" hint="評価ではなく“要件”。Yes/Noで説明可能にする。" />
+            <div className="space-y-2 text-sm">
+              <div className="flex items-center justify-between rounded-xl border border-slate-200 p-3">
+                <span className="text-slate-700">必須研修 完了</span>
+                {nurse.requiredTrainingComplete ? <Badge tone="green">OK</Badge> : <Badge tone="yellow">未完了</Badge>}
+              </div>
+              <div className="flex items-center justify-between rounded-xl border border-slate-200 p-3">
+                <span className="text-slate-700">記録期限遵守（最低ライン）</span>
+                {nurse.recordTimelinessOK ? <Badge tone="green">OK</Badge> : <Badge tone="yellow">未達</Badge>}
+              </div>
+              <div className="flex items-center justify-between rounded-xl border border-slate-200 p-3">
+                <span className="text-slate-700">無断欠勤・重大遅刻</span>
+                {!nurse.unexcusedAbsenceOverLimit ? <Badge tone="green">OK</Badge> : <Badge tone="yellow">上限超</Badge>}
+              </div>
+              <div className="flex items-center justify-between rounded-xl border border-slate-200 p-3">
+                <span className="text-slate-700">重大な懲戒・服務違反</span>
+                {!nurse.seriousDisciplinaryAction ? <Badge tone="green">OK</Badge> : <Badge tone="red">あり</Badge>}
+              </div>
+              {!nurse.eligible ? (
+                <div className="rounded-xl bg-amber-50 p-3 text-xs text-amber-900">
+                  <div className="font-semibold">対象外理由</div>
+                  <ul className="mt-1 list-disc pl-5">
+                    {nurse.eligibilityReasons.map((r) => (
+                      <li key={r}>{r}</li>
+                    ))}
+                  </ul>
+                </div>
+              ) : (
+                <div className="rounded-xl bg-emerald-50 p-3 text-xs text-emerald-900">
+                  対象資格を満たしています。本人画面には「未達があれば何をすれば対象になるか」が表示されます。
+                </div>
+              )}
+            </div>
+
+            <Divider />
+
+            <SectionTitle title="支給・残高" hint="繰延は本人残高として積み上がり、規程に従い将来支給。" />
+            <div className="grid grid-cols-2 gap-2">
+              <div className="rounded-xl border border-slate-200 p-3">
+                <div className="text-xs font-semibold text-slate-500">今年（即時）</div>
+                <div className="mt-1 text-base font-extrabold text-slate-900">{fmtJPY(nurse.ltiImmediateThisYearJPY)}</div>
+              </div>
+              <div className="rounded-xl border border-slate-200 p-3">
+                <div className="text-xs font-semibold text-slate-500">今年（繰延）</div>
+                <div className="mt-1 text-base font-extrabold text-slate-900">{fmtJPY(nurse.ltiDeferredThisYearJPY)}</div>
+              </div>
+              <div className="col-span-2 rounded-xl border border-slate-200 p-3">
+                <div className="text-xs font-semibold text-slate-500">繰延残高（累計）</div>
+                <div className="mt-1 text-xl font-extrabold text-slate-900">{fmtJPY(nurse.ltiBalanceJPY)}</div>
+                <div className="mt-1 text-xs text-slate-500">※実運用では、繰延は年度ごとに「付与→権利確定→支給」へ移行する台帳が必要。</div>
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {nurse.crossUnit ? (
+          <>
+            <Divider />
+            <SectionTitle title="横断勤務（FTE配賦）" hint="病棟/ステーション横断者は、勤怠/シフトから配賦し透明性を確保。" />
+            <div className="flex flex-wrap gap-2">
+              {nurse.fteAllocations.map((a) => (
+                <Badge key={a.unit} tone="gray">
+                  {a.unit}：{a.pct}%
+                </Badge>
+              ))}
+            </div>
+          </>
+        ) : null}
+      </CardBody>
+    </Card>
+  );
+}
+
+function ClientRoster({ roster }: { roster: Nurse[] }) {
+  const [selectedId, setSelectedId] = useState<string | null>(null);
+  const selected = roster.find((n) => n.id === selectedId) || null;
+
+  return (
+    <div className="grid gap-4 md:grid-cols-3">
+      <div className="md:col-span-2 space-y-4">
+        <Card>
+          <CardHeader
+            title="看護師名簿（対象判定・残高管理）"
+            subtitle="“勤続＋遵守ゲート”を最小データで回す。能力評価をやり過ぎない設計。"
+            right={<Badge tone="gray">患者個票なし</Badge>}
+          />
+          <CardBody>
+            <RosterTable roster={roster} onSelect={setSelectedId} />
+            <div className="mt-3 text-xs text-slate-500">
+              UXポイント：一覧では比較可能情報を最小限に。個人詳細では「対象外理由」と「次にやること」を明確にする。
+            </div>
+          </CardBody>
+        </Card>
+      </div>
+
+      <div className="md:col-span-1 space-y-4">
+        {selected ? (
+          <NurseDetail nurse={selected} />
+        ) : (
+          <Card>
+            <CardHeader title="詳細" subtitle="名簿から看護師を選択してください。" />
+            <CardBody>
+              <div className="rounded-xl bg-slate-50 p-3 text-sm text-slate-600">
+                ここには、対象判定の根拠（研修・記録・服務など）と、今年の支給見込み、繰延残高を表示します。
+              </div>
+            </CardBody>
+          </Card>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function ClientApprovals({
+  pool,
+  finGate,
+  safetyGate,
+  roster,
+  exports,
+  setExports,
+  addAudit,
+}: {
+  pool: AnnualPool;
+  finGate: FinancialGate;
+  safetyGate: SafetyGate;
+  roster: Nurse[];
+  exports: ExportJob[];
+  setExports: (x: ExportJob[]) => void;
+  addAudit: (a: AuditLog) => void;
+}) {
+  const gateOK = (!finGate.enabled || finGate.status !== "fail") && (!safetyGate.enabled || safetyGate.status !== "fail");
+  const canProceed = pool.approved && gateOK;
+
+  const eligible = roster.filter((n) => n.eligible && (n.status === "active" || n.status === "leave"));
+  const totalImmediate = eligible.reduce((acc, n) => acc + n.ltiImmediateThisYearJPY, 0);
+
+  function createExport(format: ExportJob["format"]) {
+    const id = `job-${Math.floor(Math.random() * 100000)}`;
+    const job: ExportJob = {
+      id,
+      createdAt: new Date().toISOString(),
+      createdBy: "給与担当（デモ）",
+      status: "queued",
+      format,
+      note: format === "CSV_PAYROLL" ? "給与システム連携" : "監査向け根拠資料",
+    };
+    setExports([job, ...exports]);
+    addAudit({ at: new Date().toISOString(), actor: job.createdBy, action: "export_created", scope: "export", details: `${format} created` });
+
+    // simulate completion
+    setTimeout(() => {
+      setExports((prev) =>
+        prev.map((j) => (j.id === id ? { ...j, status: "completed" } : j))
+      );
+    }, 700);
+  }
+
+  return (
+    <div className="space-y-4">
+      <Card>
+        <CardHeader
+          title="確定・承認（年度支給）"
+          subtitle="医療機関の要件：最終確定は顧客が行い、監査証跡を残す（説明責任）。"
+          right={<Badge tone={canProceed ? "green" : "yellow"}>{canProceed ? "支給実行OK" : "前提条件を確認"}</Badge>}
+        />
+        <CardBody>
+          <div className="grid gap-3 md:grid-cols-3">
+            <div className="rounded-xl border border-slate-200 p-3">
+              <div className="text-xs font-semibold text-slate-500">プール承認</div>
+              <div className="mt-1">{pool.approved ? <Badge tone="green">承認済</Badge> : <Badge tone="yellow">未承認</Badge>}</div>
+              <div className="mt-2 text-xs text-slate-500">承認履歴：{pool.approvalTrail.length}件</div>
+            </div>
+            <div className="rounded-xl border border-slate-200 p-3">
+              <div className="text-xs font-semibold text-slate-500">ゲート</div>
+              <div className="mt-1 flex gap-2">
+                <Badge tone={finGate.enabled ? (finGate.status === "pass" ? "green" : finGate.status === "warn" ? "yellow" : "red") : "gray"}>財務:{finGate.enabled ? finGate.status : "off"}</Badge>
+                <Badge tone={safetyGate.enabled ? (safetyGate.status === "pass" ? "green" : safetyGate.status === "warn" ? "yellow" : "red") : "gray"}>安全:{safetyGate.enabled ? safetyGate.status : "off"}</Badge>
+              </div>
+              <div className="mt-2 text-xs text-slate-500">fail の場合、支給停止/減額の規程適用。</div>
+            </div>
+            <div className="rounded-xl border border-slate-200 p-3">
+              <div className="text-xs font-semibold text-slate-500">即時支給 合計（対象者）</div>
+              <div className="mt-1 text-lg font-extrabold text-slate-900">{fmtJPY(totalImmediate)}</div>
+              <div className="mt-1 text-xs text-slate-500">給与連携CSVで出力可能</div>
+            </div>
+          </div>
+
+          <Divider />
+
+          <div className="flex flex-wrap items-center justify-between gap-2">
+            <div className="text-sm text-slate-700">
+              <span className="font-semibold">実行前チェック：</span>「承認済」「ゲートOK」「対象者リスト確認」「監査ログ」
+            </div>
+            <div className="flex items-center gap-2">
+              <Button variant="secondary" onClick={() => createExport("PDF_AUDIT")}>
+                監査資料（PDF）生成
+              </Button>
+              <Button onClick={() => createExport("CSV_PAYROLL")} disabled={!canProceed} title={!canProceed ? "承認/ゲート条件を満たす必要があります" : ""}>
+                給与CSVを出力
+              </Button>
+            </div>
+          </div>
+
+          <Divider />
+
+          <SectionTitle title="対象者（即時支給）プレビュー" hint="比較/順位付けは不要。根拠と合計、例外を見られれば十分。" />
+          <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white">
+            <table className="w-full text-sm">
+              <thead className="bg-slate-50 text-xs text-slate-600">
+                <tr>
+                  <th className="px-3 py-2 text-left">氏名</th>
+                  <th className="px-3 py-2 text-left">対象</th>
+                  <th className="px-3 py-2 text-right">即時支給</th>
+                  <th className="px-3 py-2 text-right">備考</th>
+                </tr>
+              </thead>
+              <tbody>
+                {roster.slice(0, 10).map((n) => (
+                  <tr key={n.id} className="border-t border-slate-100">
+                    <td className="px-3 py-2">
+                      <div className="font-semibold text-slate-900">{n.name}</div>
+                      <div className="text-xs text-slate-500">{n.employeeId}</div>
+                    </td>
+                    <td className="px-3 py-2">{n.eligible ? <Badge tone="green">対象</Badge> : <Badge tone="yellow">対象外</Badge>}</td>
+                    <td className="px-3 py-2 text-right font-semibold">{fmtJPY(n.ltiImmediateThisYearJPY)}</td>
+                    <td className="px-3 py-2 text-right text-xs text-slate-500">
+                      {!n.eligible ? "要件未達" : n.status === "leave" ? "休職/育休（規程で按分）" : ""}
+                    </td>
+                  </tr>
+                ))}
+              </tbody>
+            </table>
+          </div>
+
+          <Divider />
+
+          <SectionTitle title="エクスポート履歴" />
+          <div className="space-y-2">
+            {exports.map((e) => (
+              <div key={e.id} className="flex items-center justify-between rounded-xl border border-slate-200 bg-white p-3">
+                <div>
+                  <div className="text-sm font-semibold text-slate-900">{e.format}</div>
+                  <div className="text-xs text-slate-500">
+                    {e.createdAt} ・ {e.createdBy} ・ {e.note}
+                  </div>
+                </div>
+                <Badge tone={e.status === "completed" ? "green" : e.status === "failed" ? "red" : "yellow"}>{e.status}</Badge>
+              </div>
+            ))}
+            {exports.length === 0 ? <div className="text-sm text-slate-500">まだありません。</div> : null}
+          </div>
+        </CardBody>
+      </Card>
+    </div>
+  );
+}
+
+function ClientExports() {
+  return (
+    <Card>
+      <CardHeader title="給与連携（設計意図）" subtitle="顧客工数を減らす：集計→承認→CSVで給与へ。患者個票は不要。" />
+      <CardBody>
+        <div className="space-y-3 text-sm text-slate-700">
+          <div className="rounded-xl border border-slate-200 p-3">
+            <div className="font-semibold">推奨フロー</div>
+            <ol className="mt-2 list-decimal space-y-1 pl-5 text-sm">
+              <li>勤怠・研修・記録遵守の最小データをCSVで連携</li>
+              <li>システムが対象判定（遵守ゲート）＋勤続ポイントで自動算定</li>
+              <li>顧客が承認（監査ログ）</li>
+              <li>給与CSV出力（支給区分を明記）</li>
+            </ol>
+          </div>
+          <div className="rounded-xl bg-slate-50 p-3 text-xs text-slate-600">
+            障壁になりやすいのは「IDマスタ不整合」「異動/休職/育休の例外」「規程変更時の再計算」。本番はここをワークフロー＋ログで吸収します。
+          </div>
+          <div className="rounded-xl border border-slate-200 p-3">
+            <div className="font-semibold">CSV項目（例）</div>
+            <div className="mt-2 grid gap-2 md:grid-cols-2 text-xs text-slate-600">
+              <div className="rounded-xl bg-white p-3 ring-1 ring-slate-200">
+                <div className="font-semibold text-slate-700">入力（顧客→本システム）</div>
+                <div className="mt-1 font-mono">
+                  employeeId, unit, hireDate, status, requiredTrainingComplete, recordTimelinessOK, disciplinaryFlag, unexcusedAbsenceFlag, fteAllocations
+                </div>
+              </div>
+              <div className="rounded-xl bg-white p-3 ring-1 ring-slate-200">
+                <div className="font-semibold text-slate-700">出力（本システム→給与）</div>
+                <div className="mt-1 font-mono">employeeId, payoutJPY, payoutType=LTI_IMMEDIATE, fiscalYear, memo</div>
+              </div>
+            </div>
+          </div>
+        </div>
+      </CardBody>
+    </Card>
+  );
+}
+
+function ClientAudit({ logs }: { logs: AuditLog[] }) {
+  return (
+    <Card>
+      <CardHeader title="監査ログ" subtitle="医療機関で重要：いつ誰が何を変更/確定したか。改ざん耐性の中核。" />
+      <CardBody>
+        <div className="overflow-hidden rounded-2xl border border-slate-200 bg-white">
+          <table className="w-full text-sm">
+            <thead className="bg-slate-50 text-xs text-slate-600">
+              <tr>
+                <th className="px-3 py-2 text-left">日時</th>
+                <th className="px-3 py-2 text-left">操作者</th>
+                <th className="px-3 py-2 text-left">スコープ</th>
+                <th className="px-3 py-2 text-left">アクション</th>
+                <th className="px-3 py-2 text-left">詳細</th>
+              </tr>
+            </thead>
+            <tbody>
+              {logs.map((l, i) => (
+                <tr key={i} className="border-t border-slate-100">
+                  <td className="px-3 py-2 text-xs text-slate-600">{l.at}</td>
+                  <td className="px-3 py-2 text-sm font-semibold text-slate-900">{l.actor}</td>
+                  <td className="px-3 py-2">{<Badge tone="gray">{l.scope}</Badge>}</td>
+                  <td className="px-3 py-2 font-mono text-xs text-slate-700">{l.action}</td>
+                  <td className="px-3 py-2 text-xs text-slate-600">{l.details}</td>
+                </tr>
+              ))}
+              {logs.length === 0 ? (
+                <tr>
+                  <td className="px-3 py-6 text-sm text-slate-500" colSpan={5}>
+                    まだログがありません。
+                  </td>
+                </tr>
+              ) : null}
+            </tbody>
+          </table>
+        </div>
+        <div className="mt-3 rounded-xl bg-slate-50 p-3 text-xs text-slate-600">
+          本番では、ログの不可変性（WORMストレージ等）や、管理者権限の分離（職務分掌）も検討対象。
+        </div>
+      </CardBody>
+    </Card>
+  );
+}
+
+function ClientSupport({ tickets, setTickets }: { tickets: Ticket[]; setTickets: (t: Ticket[]) => void }) {
+  const [title, setTitle] = useState("");
+  const [body, setBody] = useState("");
+  const [cat, setCat] = useState<Ticket["category"]>("data_error");
+
+  function createTicket() {
+    const id = `T-${Math.floor(Math.random() * 100000)}`;
+    const t: Ticket = {
+      id,
+      createdAt: new Date().toISOString(),
+      createdBy: "看護部（デモ）",
+      category: cat,
+      status: "open",
+      title,
+      body,
+    };
+    setTickets([t, ...tickets]);
+    setTitle("");
+    setBody("");
+  }
+
+  return (
+    <div className="grid gap-4 md:grid-cols-2">
+      <Card>
+        <CardHeader title="問い合わせ / 異議申立て（事務局）" subtitle="制度が荒れる最大要因は“不信”。申立てフローをUIで標準化する。" />
+        <CardBody>
+          <div className="grid gap-2">
+            <label className="block">
+              <div className="text-xs font-semibold text-slate-700">カテゴリ</div>
+              <select
+                className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm font-semibold text-slate-900 outline-none focus:border-slate-400"
+                value={cat}
+                onChange={(e) => setCat(e.target.value as any)}
+              >
+                <option value="data_error">データ誤り</option>
+                <option value="policy_question">制度に関する質問</option>
+                <option value="security">セキュリティ</option>
+                <option value="other">その他</option>
+              </select>
+            </label>
+            <Input label="タイトル" value={title} onChange={setTitle} placeholder="例：研修受講が反映されない" />
+            <label className="block">
+              <div className="text-xs font-semibold text-slate-700">内容</div>
+              <textarea
+                className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-slate-400"
+                rows={5}
+                value={body}
+                onChange={(e) => setBody(e.target.value)}
+                placeholder="状況、対象者、いつのデータか、添付があれば院内で保管…など"
+              />
+            </label>
+            <Button onClick={createTicket} disabled={!title || !body}>
+              チケット作成
+            </Button>
+            <div className="text-xs text-slate-500">
+              ※患者情報（自由記述等）を貼らない。個票は扱わず、必要なら院内でマスキングしてから共有。
+            </div>
+          </div>
+        </CardBody>
+      </Card>
+
+      <Card>
+        <CardHeader title="チケット一覧" subtitle="運用負荷を最小化するため、カテゴリ/状態で整理。" />
+        <CardBody>
+          <div className="space-y-2">
+            {tickets.map((t) => (
+              <div key={t.id} className="rounded-2xl border border-slate-200 bg-white p-4">
+                <div className="flex items-start justify-between gap-2">
+                  <div>
+                    <div className="text-sm font-bold text-slate-900">{t.title}</div>
+                    <div className="mt-1 text-xs text-slate-500">{t.createdAt} ・ {t.createdBy}</div>
+                    <div className="mt-2 text-sm text-slate-700">{t.body}</div>
+                    <div className="mt-2 flex gap-2">
+                      <Badge tone="gray">{t.category}</Badge>
+                      <Badge tone={t.status === "resolved" ? "green" : t.status === "in_progress" ? "yellow" : "blue"}>{t.status}</Badge>
+                    </div>
+                  </div>
+                  <div className="flex flex-col gap-2">
+                    <Button
+                      variant="secondary"
+                      onClick={() => setTickets(tickets.map((x) => x.id === t.id ? { ...x, status: "in_progress" } : x))}
+                      disabled={t.status !== "open"}
+                    >
+                      対応中
+                    </Button>
+                    <Button
+                      variant="secondary"
+                      onClick={() => setTickets(tickets.map((x) => x.id === t.id ? { ...x, status: "resolved" } : x))}
+                      disabled={t.status === "resolved"}
+                    >
+                      解決
+                    </Button>
+                  </div>
+                </div>
+              </div>
+            ))}
+            {tickets.length === 0 ? <div className="text-sm text-slate-500">まだありません。</div> : null}
+          </div>
+        </CardBody>
+      </Card>
+    </div>
+  );
+}
+
+/* ----------------------------- Screens: Nurse ----------------------------- */
+
+function NurseHome({ nurse, pool }: { nurse: Nurse; pool: AnnualPool }) {
+  const nextActions = [];
+  if (!nurse.requiredTrainingComplete) nextActions.push("必須研修を完了する");
+  if (!nurse.recordTimelinessOK) nextActions.push("記録の期限遵守（最低ライン）を満たす");
+  if (nurse.unexcusedAbsenceOverLimit) nextActions.push("無断欠勤/遅刻の扱いを所属と確認する");
+  if (nurse.seriousDisciplinaryAction) nextActions.push("服務状況の扱いを所属と確認する");
+
+  return (
+    <div className="space-y-4">
+      <Card>
+        <CardHeader title="マイページ" subtitle="比較は出さない。自分が対象か、何をすれば対象になるか、がすぐわかる。" />
+        <CardBody>
+          <div className="grid gap-3 md:grid-cols-4">
+            <div className="rounded-xl border border-slate-200 p-3">
+              <div className="text-xs font-semibold text-slate-500">今年の見込み（即時）</div>
+              <div className="mt-1 text-xl font-extrabold text-slate-900">{fmtJPY(nurse.ltiImmediateThisYearJPY)}</div>
+              <div className="mt-1 text-xs text-slate-500">※最終確定は年度末に承認後</div>
+            </div>
+            <div className="rounded-xl border border-slate-200 p-3">
+              <div className="text-xs font-semibold text-slate-500">今年の付与（繰延）</div>
+              <div className="mt-1 text-xl font-extrabold text-slate-900">{fmtJPY(nurse.ltiDeferredThisYearJPY)}</div>
+              <div className="mt-1 text-xs text-slate-500">方式：{pool.deferralPolicy.mode}</div>
+            </div>
+            <div className="rounded-xl border border-slate-200 p-3">
+              <div className="text-xs font-semibold text-slate-500">繰延残高（累計）</div>
+              <div className="mt-1 text-xl font-extrabold text-slate-900">{fmtJPY(nurse.ltiBalanceJPY)}</div>
+              <div className="mt-1 text-xs text-slate-500">※規程に従い将来支給</div>
+            </div>
+            <div className="rounded-xl border border-slate-200 p-3">
+              <div className="text-xs font-semibold text-slate-500">対象判定</div>
+              <div className="mt-2">{nurse.eligible ? <Badge tone="green">対象</Badge> : <Badge tone="yellow">対象外</Badge>}</div>
+              <div className="mt-1 text-xs text-slate-500">勤続 {nurse.tenureYears.toFixed(1)}年（pt:{nurse.tenurePoints}）</div>
+            </div>
+          </div>
+
+          <Divider />
+
+          <SectionTitle title="対象資格（遵守ゲート）" />
+          <div className="grid gap-2 md:grid-cols-2">
+            <div className="flex items-center justify-between rounded-xl border border-slate-200 p-3">
+              <span className="text-sm text-slate-700">必須研修 完了</span>
+              {nurse.requiredTrainingComplete ? <Badge tone="green">OK</Badge> : <Badge tone="yellow">未完了</Badge>}
+            </div>
+            <div className="flex items-center justify-between rounded-xl border border-slate-200 p-3">
+              <span className="text-sm text-slate-700">記録期限遵守</span>
+              {nurse.recordTimelinessOK ? <Badge tone="green">OK</Badge> : <Badge tone="yellow">未達</Badge>}
+            </div>
+            <div className="flex items-center justify-between rounded-xl border border-slate-200 p-3">
+              <span className="text-sm text-slate-700">無断欠勤/重大遅刻</span>
+              {!nurse.unexcusedAbsenceOverLimit ? <Badge tone="green">OK</Badge> : <Badge tone="yellow">上限超</Badge>}
+            </div>
+            <div className="flex items-center justify-between rounded-xl border border-slate-200 p-3">
+              <span className="text-sm text-slate-700">重大な服務違反</span>
+              {!nurse.seriousDisciplinaryAction ? <Badge tone="green">OK</Badge> : <Badge tone="red">あり</Badge>}
+            </div>
+          </div>
+
+          <div className="mt-3 rounded-2xl bg-slate-50 p-4 text-sm text-slate-700">
+            <div className="font-semibold">次にやること</div>
+            {nextActions.length === 0 ? (
+              <div className="mt-1 text-slate-600">現在、対象資格を満たしています。</div>
+            ) : (
+              <ul className="mt-2 list-disc pl-5">
+                {nextActions.map((a) => (
+                  <li key={a}>{a}</li>
+                ))}
+              </ul>
+            )}
+          </div>
+        </CardBody>
+      </Card>
+    </div>
+  );
+}
+
+function NurseRules({ pool }: { pool: AnnualPool }) {
+  return (
+    <Card>
+      <CardHeader title="ルール（本人向け）" subtitle="“なぜこの金額か”を一枚で説明。比較・ランキングは出さない。" />
+      <CardBody>
+        <div className="space-y-3 text-sm text-slate-700">
+          <div className="rounded-xl border border-slate-200 p-3">
+            <div className="font-semibold">制度の目的</div>
+            <div className="mt-1 text-slate-600">長く安心して働ける環境づくり（定着）と、最低限のルール遵守を支えるための中長期貢献賞与（LTI）です。</div>
+          </div>
+          <div className="rounded-xl border border-slate-200 p-3">
+            <div className="font-semibold">あなたの金額の決まり方</div>
+            <ol className="mt-2 list-decimal space-y-1 pl-5 text-slate-600">
+              <li>年度ごとに、財務健全性と品質・安全の状況を確認し、プール額を決めます（承認制）。</li>
+              <li>対象資格（必須研修・記録・服務など）を満たした人が対象になります。</li>
+              <li>対象者の間で、勤続年数帯のポイントに応じて分配されます（能力評価はしません）。</li>
+              <li>一部は即時支給、残りは繰延として残高に積み上がります。</li>
+            </ol>
+          </div>
+          <div className="rounded-xl bg-slate-50 p-3 text-xs text-slate-600">
+            即時 {pool.payoutMix.immediatePct}% ／ 繰延 {pool.payoutMix.deferredPct}% ／ 繰延方式：{pool.deferralPolicy.mode}
+          </div>
+          <div className="rounded-xl border border-slate-200 p-3">
+            <div className="font-semibold">個人情報と安全</div>
+            <div className="mt-1 text-slate-600">
+              本システムは患者個票（診療情報・自由記述等）を扱いません。評価・判定は職員データと集計情報のみで行います。
+            </div>
+          </div>
+        </div>
+      </CardBody>
+    </Card>
+  );
+}
+
+function NurseTickets({ tickets, setTickets, nurse }: { tickets: Ticket[]; setTickets: (t: Ticket[]) => void; nurse: Nurse }) {
+  const [title, setTitle] = useState("");
+  const [body, setBody] = useState("");
+
+  function create() {
+    const id = `NT-${Math.floor(Math.random() * 100000)}`;
+    setTickets([
+      {
+        id,
+        createdAt: new Date().toISOString(),
+        createdBy: nurse.name,
+        category: "data_error",
+        status: "open",
+        title,
+        body,
+        relatedNurseId: nurse.id,
+      },
+      ...tickets,
+    ]);
+    setTitle("");
+    setBody("");
+  }
+
+  const my = tickets.filter((t) => t.relatedNurseId === nurse.id);
+
+  return (
+    <div className="grid gap-4 md:grid-cols-2">
+      <Card>
+        <CardHeader title="申立て（本人）" subtitle="データ誤り・研修反映漏れ等。患者情報は書かない。" />
+        <CardBody>
+          <Input label="タイトル" value={title} onChange={setTitle} placeholder="例：研修受講が反映されていない" />
+          <div className="mt-2">
+            <label className="block">
+              <div className="text-xs font-semibold text-slate-700">内容</div>
+              <textarea
+                className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-slate-400"
+                rows={6}
+                value={body}
+                onChange={(e) => setBody(e.target.value)}
+                placeholder="いつ/どの研修/どの画面、など"
+              />
+            </label>
+          </div>
+          <div className="mt-2 flex justify-end">
+            <Button onClick={create} disabled={!title || !body}>送信</Button>
+          </div>
+          <div className="mt-2 text-xs text-slate-500">
+            ※個人情報（患者特定につながる情報）は記載しないでください。
+          </div>
+        </CardBody>
+      </Card>
+
+      <Card>
+        <CardHeader title="あなたのチケット" subtitle="対応状況が見えると不信が減る。" />
+        <CardBody>
+          <div className="space-y-2">
+            {my.map((t) => (
+              <div key={t.id} className="rounded-2xl border border-slate-200 bg-white p-4">
+                <div className="flex items-start justify-between gap-2">
+                  <div>
+                    <div className="text-sm font-bold text-slate-900">{t.title}</div>
+                    <div className="mt-1 text-xs text-slate-500">{t.createdAt}</div>
+                    <div className="mt-2 text-sm text-slate-700">{t.body}</div>
+                  </div>
+                  <Badge tone={t.status === "resolved" ? "green" : t.status === "in_progress" ? "yellow" : "blue"}>{t.status}</Badge>
+                </div>
+              </div>
+            ))}
+            {my.length === 0 ? <div className="text-sm text-slate-500">まだありません。</div> : null}
+          </div>
+        </CardBody>
+      </Card>
+    </div>
+  );
+}
+
+/* ----------------------------- Screens: Operator (Vendor) ----------------------------- */
+
+function OperatorOverview({ tenant, finGate, safetyGate, pool }: { tenant: Tenant; finGate: FinancialGate; safetyGate: SafetyGate; pool: AnnualPool }) {
+  return (
+    <Card>
+      <CardHeader title="運用監視（ベンダー）" subtitle="顧客の合意形成・運用を支える。PHIを持たない設計（推奨）。" />
+      <CardBody>
+        <div className="grid gap-3 md:grid-cols-3">
+          <div className="rounded-2xl border border-slate-200 p-4">
+            <div className="text-xs font-semibold text-slate-500">テナント</div>
+            <div className="mt-1 text-lg font-extrabold text-slate-900">{tenant.name}</div>
+            <div className="mt-1 text-xs text-slate-500">契約：デモ / PHI:{tenant.hasPHI ? "あり" : "なし"}</div>
+          </div>
+          <div className="rounded-2xl border border-slate-200 p-4">
+            <div className="text-xs font-semibold text-slate-500">ゲート状況</div>
+            <div className="mt-2 flex flex-wrap gap-2">
+              <Badge tone={finGate.status === "pass" ? "green" : finGate.status === "warn" ? "yellow" : "red"}>財務:{finGate.status}</Badge>
+              <Badge tone={safetyGate.status === "pass" ? "green" : safetyGate.status === "warn" ? "yellow" : "red"}>安全:{safetyGate.status}</Badge>
+            </div>
+            <div className="mt-2 text-xs text-slate-500">fail の場合、顧客へ「支給停止・再承認」手順を案内。</div>
+          </div>
+          <div className="rounded-2xl border border-slate-200 p-4">
+            <div className="text-xs font-semibold text-slate-500">年度プール</div>
+            <div className="mt-1 text-lg font-extrabold text-slate-900">{fmtJPY(pool.decidedPoolJPY)}</div>
+            <div className="mt-1 text-xs text-slate-500">承認:{pool.approved ? "済" : "未"}</div>
+          </div>
+        </div>
+
+        <div className="mt-4 rounded-2xl bg-slate-50 p-4 text-xs text-slate-700">
+          <div className="font-semibold">運営側が握るべき“参入障壁”</div>
+          <ul className="mt-2 list-disc space-y-1 pl-5">
+            <li>規程テンプレ（医療法人/営利訪看で言い回しを出し分け）</li>
+            <li>例外処理（異動・休職・育休・退職・Good/Bad leaver）の実装と説明</li>
+            <li>監査ログ、承認フロー、データ品質検知（欠損・異常）</li>
+            <li>“ゼロPHI”運用パターン（院内集計→連携）</li>
+          </ul>
+        </div>
+      </CardBody>
+    </Card>
+  );
+}
+
+function OperatorSecurity() {
+  return (
+    <Card>
+      <CardHeader title="セキュリティ（ベンダー）" subtitle="医療向けSaaSの調達審査で問われる要素を“見える化”する。" />
+      <CardBody>
+        <div className="grid gap-3 md:grid-cols-2">
+          <div className="rounded-2xl border border-slate-200 p-4">
+            <div className="text-sm font-bold text-slate-900">基本方針</div>
+            <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-slate-700">
+              <li>患者個票を保持しない（ゼロPHI）</li>
+              <li>職員データも最小化（勤怠・研修・遵守フラグ）</li>
+              <li>RBAC（職務分掌）＋監査ログ（不可変）</li>
+              <li>暗号化（通信/保存）＋鍵管理</li>
+              <li>インシデント対応（報告・封じ込め・原因分析）</li>
+            </ul>
+          </div>
+          <div className="rounded-2xl border border-slate-200 p-4">
+            <div className="text-sm font-bold text-slate-900">調達審査での提出物（例）</div>
+            <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-slate-700">
+              <li>情報セキュリティ方針・体制</li>
+              <li>委託契約条項（再委託、監査権、事故時報告、責任分界）</li>
+              <li>データフロー図（患者個票なしの説明）</li>
+              <li>権限設計（RBAC）・ログ設計</li>
+              <li>BCP/バックアップ/復旧手順</li>
+            </ul>
+          </div>
+        </div>
+        <div className="mt-4 rounded-2xl bg-slate-50 p-4 text-xs text-slate-700">
+          実装方針：顧客工数を減らしながら審査を通すには、最初から「集計値のみ連携」「自由記述を取り込まない」「n閾値」を製品仕様として固定するのが強い。
+        </div>
+      </CardBody>
+    </Card>
+  );
+}
+
+function OperatorTemplates() {
+  return (
+    <Card>
+      <CardHeader title="テンプレ（ベンダー）" subtitle="最短導入の鍵：制度テンプレ・FAQ・規程骨子のパッケージ化。" />
+      <CardBody>
+        <div className="grid gap-3 md:grid-cols-2">
+          <div className="rounded-2xl border border-slate-200 p-4">
+            <div className="text-sm font-bold text-slate-900">テンプレパッケージ（医療法人向け）</div>
+            <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-slate-700">
+              <li>「利益按分」を避けた言い回し（財務健全性ゲート＋決議＋キャップ）</li>
+              <li>勤続ポイント＋遵守ゲート（能力評価をしない）</li>
+              <li>Good/Bad leaver、退職時支給、育休/休職の扱い</li>
+              <li>院内説明会用FAQ（非営利の納得感）</li>
+            </ul>
+          </div>
+          <div className="rounded-2xl border border-slate-200 p-4">
+            <div className="text-sm font-bold text-slate-900">テンプレパッケージ（営利訪看向け）</div>
+            <ul className="mt-2 list-disc space-y-1 pl-5 text-sm text-slate-700">
+              <li>採用・定着のROI試算シート</li>
+              <li>SOがある場合の住み分け（幹部=SO、現場=LTI）</li>
+              <li>拠点拡大（多拠点）に耐える運用設計</li>
+              <li>データ連携（CSV最小）と運用BPO</li>
+            </ul>
+          </div>
+        </div>
+      </CardBody>
+    </Card>
+  );
+}
+
+/* ----------------------------- App ----------------------------- */
+
+export default function App() {
+  const [role, setRole] = useState<Role>("client_admin");
+  const [nav, setNav] = useState<NavKey>("client_dashboard");
+
+  const [tenant] = useState<Tenant>(DEMO_TENANT);
+
+  const [pool, setPool] = useState<AnnualPool>(DEMO_POOL);
+  const [finGate, setFinGate] = useState<FinancialGate>(DEMO_FIN_GATE);
+  const [safetyGate, setSafetyGate] = useState<SafetyGate>(DEMO_SAFETY_GATE);
+
+  const [bands, setBands] = useState<TenureBand[]>(DEMO_TENURE_BANDS);
+  const [rules, setRules] = useState<EligibilityRule[]>(DEMO_ELIGIBILITY_RULES);
+
+  const [exports, setExports] = useState<ExportJob[]>([]);
+  const [audit, setAudit] = useState<AuditLog[]>([
+    { at: "2026-04-02T09:10:00+09:00", actor: "人事（本部）", action: "pool_drafted", scope: "pool", details: "Annual pool drafted" },
+    { at: "2026-04-10T14:20:00+09:00", actor: "経営会議", action: "pool_approved", scope: "pool", details: "Annual pool approved" },
+  ]);
+  const [tickets, setTickets] = useState<Ticket[]>([]);
+
+  // derived roster
+  const roster = useMemo(() => computeRoster(tenant, pool, bands, rules, DEMO_NURSES_BASE), [tenant, pool, bands, rules]);
+
+  // For nurse role, pick a nurse
+  const nurseMe = roster.find((n) => n.id === "n-003") || roster[0];
+
+  // role-based nav coercion
+  React.useEffect(() => {
+    if (role === "nurse" && !nav.startsWith("nurse_")) setNav("nurse_home");
+    if (role === "operator" && !nav.startsWith("operator_")) setNav("operator_overview");
+    if (role !== "nurse" && role !== "operator" && !(nav.startsWith("client_"))) setNav("client_dashboard");
+  }, [role]);
+
+  const navTitle = useMemo(() => {
+    const map: Record<NavKey, string> = {
+      client_dashboard: "ダッシュボード",
+      client_setup_wizard: "導入ウィザード",
+      client_policy: "制度ルール（ルールブック）",
+      client_roster: "看護師名簿",
+      client_approvals: "確定・承認",
+      client_exports: "給与連携",
+      client_audit: "監査ログ",
+      client_support: "問い合わせ",
+      nurse_home: "マイページ",
+      nurse_rules: "ルール",
+      nurse_tickets: "申立て",
+      operator_overview: "運用監視",
+      operator_tenants: "テナント管理（未実装）",
+      operator_security: "セキュリティ",
+      operator_integrations: "連携監視（未実装）",
+      operator_templates: "テンプレ",
+      operator_incident: "インシデント（未実装）",
+    };
+    return map[nav] || "—";
+  }, [nav]);
+
+  function addAudit(a: AuditLog) {
+    setAudit((prev) => [a, ...prev]);
+  }
+
+  function openSetup() {
+    setNav("client_setup_wizard");
+  }
+
+  return (
+    <div className="min-h-screen bg-slate-50">
+      <Topbar tenant={tenant} role={role} onRoleChange={setRole} navTitle={navTitle} />
+      <div className="mx-auto grid max-w-7xl gap-4 px-4 py-4 md:grid-cols-[288px_1fr]">
+        <Sidebar role={role} nav={nav} setNav={setNav} />
+
+        <main className="space-y-4">
+          {/* Role banner */}
+          <div className="rounded-2xl border border-slate-200 bg-white p-4 shadow-sm">
+            <div className="flex flex-wrap items-center justify-between gap-2">
+              <div>
+                <div className="text-xs font-semibold text-slate-500">表示モード</div>
+                <div className="text-sm font-bold text-slate-900">
+                  {role === "client_admin"
+                    ? "クライアント管理者（制度設計・承認）"
+                    : role === "client_payroll"
+                    ? "クライアント給与担当（出力・連携）"
+                    : role === "client_viewer"
+                    ? "クライアント閲覧のみ"
+                    : role === "nurse"
+                    ? `看護師（本人）: ${nurseMe.name}`
+                    : "運営（ベンダー）"}
+                </div>
+              </div>
+              <div className="flex items-center gap-2">
+                <Badge tone="green">ゼロPHI</Badge>
+                <Badge tone="gray">勤続＋遵守ゲート</Badge>
+                <Badge tone="blue">承認フロー</Badge>
+              </div>
+            </div>
+          </div>
+
+          {/* Screens */}
+          {nav === "client_dashboard" ? (
+            <ClientDashboard tenant={tenant} pool={pool} finGate={finGate} safetyGate={safetyGate} roster={roster} openSetup={openSetup} />
+          ) : null}
+
+          {nav === "client_setup_wizard" ? (
+            <SetupWizard
+              pool={pool}
+              setPool={setPool}
+              finGate={finGate}
+              setFinGate={setFinGate}
+              safetyGate={safetyGate}
+              setSafetyGate={setSafetyGate}
+              bands={bands}
+              setBands={setBands}
+              rules={rules}
+              setRules={setRules}
+              addAudit={addAudit}
+            />
+          ) : null}
+
+          {nav === "client_policy" ? <ClientPolicy pool={pool} finGate={finGate} safetyGate={safetyGate} bands={bands} rules={rules} /> : null}
+
+          {nav === "client_roster" ? <ClientRoster roster={roster} /> : null}
+
+          {nav === "client_approvals" ? (
+            <ClientApprovals pool={pool} finGate={finGate} safetyGate={safetyGate} roster={roster} exports={exports} setExports={setExports} addAudit={addAudit} />
+          ) : null}
+
+          {nav === "client_exports" ? <ClientExports /> : null}
+
+          {nav === "client_audit" ? <ClientAudit logs={audit} /> : null}
+
+          {nav === "client_support" ? <ClientSupport tickets={tickets} setTickets={setTickets} /> : null}
+
+          {nav === "nurse_home" ? <NurseHome nurse={nurseMe} pool={pool} /> : null}
+          {nav === "nurse_rules" ? <NurseRules pool={pool} /> : null}
+          {nav === "nurse_tickets" ? <NurseTickets tickets={tickets} setTickets={setTickets} nurse={nurseMe} /> : null}
+
+          {nav === "operator_overview" ? <OperatorOverview tenant={tenant} finGate={finGate} safetyGate={safetyGate} pool={pool} /> : null}
+          {nav === "operator_security" ? <OperatorSecurity /> : null}
+          {nav === "operator_templates" ? <OperatorTemplates /> : null}
+
+          {/* Unimplemented placeholders */}
+          {nav === "operator_tenants" || nav === "operator_integrations" || nav === "operator_incident" ? (
+            <Card>
+              <CardHeader title="未実装（プロトタイプ）" subtitle="必要なら、テナント一覧・連携監視・インシデント管理をこの単一ファイルに追加できます。" />
+              <CardBody>
+                <div className="rounded-xl bg-slate-50 p-3 text-sm text-slate-700">
+                  次に作るなら：
+                  <ul className="mt-2 list-disc pl-5 text-sm text-slate-600">
+                    <li>テナント管理：契約/ロール/データ保持/削除/監査提出物</li>
+                    <li>連携監視：CSV受領履歴、欠損検知、IDマスタ不整合の自動レポート</li>
+                    <li>インシデント：報告→対応→顧客通知→事後レビューのワークフロー</li>
+                  </ul>
+                </div>
+              </CardBody>
+            </Card>
+          ) : null}
+
+          {/* Footer */}
+          <div className="py-6 text-center text-xs text-slate-500">
+            デモUI：中長期貢献賞与（LTI）運用プラットフォーム（ゼロPHI設計）・提案用プロトタイプ
+          </div>
+        </main>
+      </div>
+    </div>
+  );
+}
